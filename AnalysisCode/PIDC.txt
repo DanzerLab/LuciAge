@@ -1,0 +1,121 @@
+# replace *...* with respective text
+
+### in R 
+library(qs)
+library(Seurat)
+library(magrittr)
+library(sva)
+library(dplyr)
+
+seurat_integrated <- *filtered, integrated and annotated seurat object*
+
+dir_path <- "*directory path holding all differential results; see sn-pseudobulk_DEG_DESEQ2.R" 
+sigres_files <- list.files(path = dir_path, pattern = "^GABA-Rgs9 Neuron.*_sigres\\.xlsx$", full.names = TRUE)
+sigres_data_frames <- list()
+for(file_path in sigres_files) {
+  id <- sub("^(GABA-Rgs9 Neuron.*_sigres)\\.xlsx$", "\\1", basename(file_path))
+  df <- read_xlsx(file_path)
+  sigres_data_frames[[id]] <- df
+}
+geneSet_list <- *list of geneSets of signatures*
+
+comps <- c(*names of the signatures in the geneSet_list*)
+
+seurat_integrated <- subset(seurat_integrated, CellLevel3 == "GABA-Rgs9 Neuron")
+
+# batch correction using sva package
+counts <- as.matrix(GetAssayData(seurat_integrated, slot="data"))
+counts <- counts[!grepl("^mt-", rownames(counts)), ]
+counts <- counts[-which(rownames(counts) %in% rb), ]
+metadata <- seurat_integrated@meta.data
+mm <- model.matrix(~condition, metadata)
+mat <- limma::removeBatchEffect(counts, batch=metadata$sex, batch2 = metadata$batch, design=mm)
+
+ON24count <- mat[,which(colnames(mat) %in% metadata$cells[which(metadata$condition == "synON24M")])]
+OFF24count <- mat[,which(colnames(mat) %in% metadata$cells[which(metadata$condition == "synOFF24M")])]
+lateON24count <- mat[,which(colnames(mat) %in% metadata$cells[which(metadata$condition == "synlateON24M")])]
+ON16count <- mat[,which(colnames(mat) %in% metadata$cells[which(metadata$condition == "synON16M")])]
+OFF16count <- mat[,which(colnames(mat) %in% metadata$cells[which(metadata$condition == "synOFF16M")])]
+lateON16count <- mat[,which(colnames(mat) %in% metadata$cells[which(metadata$condition == "synlateON16M")])]
+ON6count <- mat[,which(colnames(mat) %in% metadata$cells[which(metadata$condition == "synON6M")])]
+OFF6count <- mat[,which(colnames(mat) %in% metadata$cells[which(metadata$condition == "synOFF6M")])]
+
+for (comp in comps){
+  print(comp)
+  ## just checking if we are getting the correct genes
+  if (paste0("GABA-Rgs9 Neuron_",comp,"_sigres") %in% names(sigres_data_frames)){
+    print("Found comp in sigres_data_frames!")
+    sigGene <- sigres_data_frames[[paste0("GABA-Rgs9 Neuron_",comp,"_sigres")]]$gene
+  }else if (comp %in% names(geneSet_list_list)){
+    print("Found comp in geneSet_list_list!")
+    sigGene <- geneSet_list_list[[comp]]
+  }
+  
+  sigGene <- sigGene[!grepl("^Gm|Rik$", sigGene)]
+  ON24count_sub <- ON24count[sigGene,]
+  OFF24count_sub <- OFF24count[sigGene,]
+  lateON24count_sub <- lateON24count[sigGene,]
+  ON16count_sub <- ON16count[sigGene,]
+  OFF16count_sub <- OFF16count[sigGene,]
+  lateON16count_sub <- lateON16count[sigGene,]
+  ON6count_sub <- ON6count[sigGene,]
+  OFF6count_sub <- OFF6count[sigGene,]
+  
+  ON24count_table <- rbind(colnames(ON24count_sub), ON24count_sub)
+  OFF24count_table <- rbind(colnames(OFF24count_sub), OFF24count_sub)
+  lateON24count_table <- rbind(colnames(lateON24count_sub), lateON24count_sub)
+  ON16count_table <- rbind(colnames(ON16count_sub), ON16count_sub)
+  OFF16count_table <- rbind(colnames(OFF16count_sub), OFF16count_sub)
+  lateON16count_table <- rbind(colnames(lateON16count_sub), lateON16count_sub)
+  ON6count_table <- rbind(colnames(ON6count_sub), ON6count_sub)
+  OFF6count_table <- rbind(colnames(OFF6count_sub), OFF6count_sub)
+  
+  write.table(ON24count_table, file = paste0("*path to save the count matrices for PIDC*/ON24BGN_",comp,".txt"), sep = "\t", row.names = TRUE, col.names = FALSE)
+  write.table(OFF24count_table, file = paste0("*path to save the count matrices for PIDC*/OFF24BGN_",comp,".txt"), sep = "\t", row.names = TRUE, col.names = FALSE)
+  write.table(lateON24count_table, file = paste0("*path to save the count matrices for PIDC*/lateON24BGN_",comp,".txt"), sep = "\t", row.names = TRUE, col.names = FALSE)
+  write.table(ON16count_table, file = paste0("*path to save the count matrices for PIDC*/ON16BGN_",comp,".txt"), sep = "\t", row.names = TRUE, col.names = FALSE)
+  write.table(OFF16count_table, file = paste0("*path to save the count matrices for PIDC*/OFF16BGN_",comp,".txt"), sep = "\t", row.names = TRUE, col.names = FALSE)
+  write.table(lateON16count_table, file = paste0("*path to save the count matrices for PIDC*/lateON16BGN_",comp,".txt"), sep = "\t", row.names = TRUE, col.names = FALSE)
+  write.table(ON6count_table, file = paste0("*path to save the count matrices for PIDC*/ON6BGN_",comp,".txt"), sep = "\t", row.names = TRUE, col.names = FALSE)
+  write.table(OFF6count_table, file = paste0("*path to save the count matrices for PIDC*/OFF6BGN_",comp,".txt"), sep = "\t", row.names = TRUE, col.names = FALSE)
+}
+
+## then in jupyter notebook with Julia Kernel (1.8.1)
+# make sure that the count matrices are in the same directory
+using Pkg
+Pkg.update()
+Pkg.add("NetworkInference")
+Pkg.add("GraphPlot")
+Pkg.add("Graphs")
+Pkg.add("Karnak")
+Pkg.add("ColorTypes")
+Pkg.add("CSV") 
+Pkg.add("DataFrames")
+Pkg.add("Glob")
+using NetworkInference
+using Karnak
+using GraphPlot
+using Graphs
+using ColorTypes
+using CSV, DataFrames
+using Glob
+
+# this code will run PIDC and save the adjacency matrix of the interactions with a top 10% interaction score
+txt_files = glob("*.txt")
+threshold = 0.1
+algorithm = PIDCNetworkInference() 
+
+for file in txt_files
+    dataset_name = splitext(basename(file))[1]  # Extracts the file name without extension
+    @time genes = get_nodes(file);  # Assuming get_nodes can work with the full path
+    @time network = InferredNetwork(algorithm, genes);
+    adjacency_matrix, labels_to_ids, ids_to_labels = get_adjacency_matrix(network, threshold)
+    number_of_nodes = size(adjacency_matrix)[1]
+    nodelabels = []
+    for i in 1:number_of_nodes
+        push!(nodelabels, ids_to_labels[i])
+    end
+    df = DataFrame(adjacency_matrix, nodelabels)
+    output_filename = joinpath("adjMatrix/10perct", "$(dataset_name)_adjMatrix.csv")  # Dynamically create file name
+    CSV.write(output_filename, df)
+end

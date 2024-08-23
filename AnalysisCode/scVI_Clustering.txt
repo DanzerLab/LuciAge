@@ -1,0 +1,117 @@
+# getting h5ad file from Seurat
+# replace *...* with respective text
+
+
+### in R
+library(Seurat)
+library(tidyverse)
+library(Matrix)
+
+outpathRNA="*path to save*"
+seurat_integrated <- qread(*path to seurat_filtered; see cellXY.R script*)
+seurat_integrated$batchCorrect <- paste0(seurat_integrated$sex, seurat_integrated$nAnimals, seurat_integrated$batch,seurat_integrated$age)
+seurat_integrated <- SCTransform(seurat_integrated, vars.to.regress = c("percent.mt","percent.ribo", "batchCorrect"), assay = "RNA",
+                                 min_cells = 3, variable.features.n = 4000, method = "glmGamPoi", return.only.var.genes = TRUE)
+# write matrix data (gene expression counts) 
+counts_matrix <- GetAssayData(seurat_integrated, assay='RNA', slot='counts')
+writeMM(counts_matrix, file=paste0(file=paste0(outpathRNA,"matrix.mtx")))
+
+# write gene names
+write.table(data.frame('gene'=rownames(counts_matrix)),
+            file=paste0(file=paste0(outpathRNA,"gene_names.csv")),
+            quote=F,row.names=F,col.names=F)
+
+
+# save metadata table:
+write.csv(seurat_integrated@meta.data, file=paste0(outpathRNA,"metadata.csv"), 
+          quote=F, row.names=F)
+
+#### in Python 
+import numpy as np
+import pandas as pd
+import scanpy as sc
+import anndata
+from scipy import io
+from scipy.sparse import coo_matrix, csr_matrix
+import os
+
+X = io.mmread("*outpathRNA from R script*/matrix.mtx")
+adata = anndata.AnnData(X=X.transpose().tocsr(), dtype=X.dtype)
+metadata = pd.read_csv("*outpathRNA from R script*/metadata.csv")
+with open("*outpathRNA from R script*/gene_names.csv", "r") as f:
+	gene_names = f.read().splitlines()
+
+
+adata.obs = metadata
+adata.obs.index = adata.obs["cells"]
+adata.var.index = gene_names
+adata.write("*outpathRNA from R script*/luci_RNA_Cells.h5ad")
+
+import mudata as md
+from mudata import MuData
+from scipy.sparse import csr_matrix
+import anndata as ad
+import anndata2ri
+import logging
+import scvi
+import scanpy as sc
+import matplotlib.pyplot as plt
+
+import rpy2.rinterface_lib.callbacks as rcb
+import rpy2.robjects as ro
+
+rcb.logger.setLevel(logging.ERROR)
+ro.pandas2ri.activate()
+anndata2ri.activate()
+
+# specify number of features and name of batch for later training
+nfeatures=6500
+Batch="*column name of metadata with all batch effects combined*"
+
+# Open h5 file and prepare and make backup
+adata_merge=sc.read_h5ad("*outpathRNA from R script*/luci_RNA_Cells.h5ad")
+adata_merge.layers["data"]=adata_merge.X
+adata_merge.layers["counts"]=adata_merge.X
+adata_merge.X=adata_merge.layers["counts"]
+adata_merge_raw = adata_merge
+
+# Find variable features
+sc.pp.highly_variable_genes(adata_merge,
+    n_top_genes=nfeatures,
+    subset=True,
+    layer="counts",
+    flavor="seurat_v3",
+    batch_key=Batch)
+
+# train the model, check if we need any categorical or continous covariates are necessary and if names are correct
+scvi.model.SCVI.setup_anndata(adata_merge,batch_key=Batch, layer="counts", continuous_covariate_keys=["percent.mt", "percent.ribo", "nUMI", "nGene"])
+model = scvi.model.SCVI(adata_merge, n_latent=50)
+model.train(use_gpu=True, early_stopping=True)
+
+# using rpy2 to save latent representation as .rds
+from rpy2.robjects.packages import importr
+from rpy2.robjects import pandas2ri
+import rpy2.robjects as robjects
+asmatrix = robjects.r["as.matrix"]
+saveRDS = robjects.r['saveRDS']
+
+latentRNA = model.get_latent_representation()
+latentRNA = asmatrix(latentRNA)
+saveRDS(latentRNA,"*outpathRNA from R script*/scVI_batchCorrect.rds")
+
+### now back in R
+
+latentRNA <- readRDS("*outpathRNA from R script*/scVI_batchCorrect.rds")
+rownames(latentRNA) = colnames(seurat_integrated)
+names <- c(1:50)
+colnames(latentRNA) = names
+DefaultAssay(seurat_integrated) <- "SCT"
+
+seurat_integrated[["scvi"]] <- CreateDimReducObject(embeddings = latentRNA, key = "scvi_", assay = DefaultAssay(seurat_integrated))
+
+# clustering
+resolutions_list <- c(0.1,0.2,0.4,0.6)
+seurat_integrated <- FindNeighbors(object = seurat_integrated, dims = 1:50, reduction = "scvi")
+seurat_integrated <- FindClusters(object = seurat_integrated, resolution = resolutions_list)
+seurat_integrated <- RunUMAP(seurat_integrated, dims = 1:50, reduction = "scvi", n.components = 2, 
+                             n.neighbors = 200, min.dist = 0.3, seed.use = 12345) # n.neighbors and min.dist can be changed. This is just for visualization
