@@ -1,0 +1,4 @@
+S1S2	Veselin	exon	412	663	.	-	.	gene_id "S1S2"; transcript_id "SynLuc2"; gene_name "S1S2"; gene_biotype "protein_coding";
+S1S2	Veselin	exon	1237	2153	.	-	.	gene_id "S1S2"; transcript_id "SynLuc2"; gene_name "S1S2"; gene_biotype "protein_coding";
+S1S2	Veselin	exon	2495	3442	.	+	.	gene_id "S1S2"; transcript_id "SynLuc1"; gene_name "S1S2"; gene_biotype "protein_coding";
+S1S2	Veselin	exon	4016	4267	.	+	.	gene_id "S1S2"; transcript_id "SynLuc1"; gene_name "S1S2"; gene_biotype "protein_coding";

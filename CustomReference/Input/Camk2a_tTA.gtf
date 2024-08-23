@@ -1,0 +1,5 @@
+Camk2aTTA	Veselin	gene	6729	10172	.	+	.	gene_id "Camk2aTTA"; gene_name "Camk2aTTA"; gene_biotype "protein_coding";
+Camk2aTTA	Veselin	transcript	8018	10172	.	+	.	gene_id "Camk2aTTA"; transcript_id "tTA"; gene_name "Camk2aTTA"; transcript_name "tTA"; transcript_biotype "protein_coding"; gene_biotype "protein_coding";
+Camk2aTTA	Veselin	exon	8018	8088	.	+	.	gene_id "Camk2aTTA"; transcript_id "tTA"; gene_name "Camk2aTTA"; transcript_name "tTA"; gene_biotype "protein_coding";
+Camk2aTTA	Veselin	exon	8319	9550	.	+	.	gene_id "Camk2aTTA"; transcript_id "tTA"; gene_name "Camk2aTTA"; transcript_name "tTA"; gene_biotype "protein_coding";
+Camk2aTTA	Veselin	exon	9617	10172	.	+	.	gene_id "Camk2aTTA"; transcript_id "tTA"; gene_name "Camk2aTTA"; transcript_name "tTA"; gene_biotype "protein_coding";
