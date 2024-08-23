@@ -1,0 +1,80 @@
+merged_seurat <- qread(path to merged seurat, meaning not filtered yet)
+metadata <- merged_seurat@meta.data
+## showing QC filtering
+
+ggplot(metadata, aes(x=nUMI, y=nGene,color=percent.mt)) + 
+  geom_point_rast() + 
+  scale_colour_gradient(low = "gray90", high = "black")+
+  stat_smooth(method=lm) +  # Add this to keep stat_smooth in default color
+  scale_x_log10() + 
+  scale_y_log10() + 
+  theme_classic() +
+  geom_vline(xintercept = 2500) +
+  geom_hline(yintercept = 1500) +
+  facet_wrap(~condition)+
+  theme(strip.text = element_text(size = 20, face = "bold"),
+        axis.title = element_text(size = 15),
+        legend.text = element_text(size = 15),
+        legend.title = element_text(size = 15))
+ggplot(metadata, aes(x=nUMI, y=nGene,color=percent.ribo)) + 
+  geom_point_rast() + 
+  scale_colour_gradient(low = "gray90", high = "black")+
+  stat_smooth(method=lm) +  # Add this to keep stat_smooth in default color
+  scale_x_log10() + 
+  scale_y_log10() + 
+  theme_classic() +
+  geom_vline(xintercept = 2500) +
+  geom_hline(yintercept = 1500) +
+  facet_wrap(~condition)+
+  theme(strip.text = element_text(size = 20, face = "bold"),
+        axis.title = element_text(size = 15),
+        legend.text = element_text(size = 15),
+        legend.title = element_text(size = 15))
+
+condColors <- c("synOFF6M" = "seashell3", "synOFF16M" = "gray47", "synOFF24M" = "gray5", "synON6M" = "lightcoral", 
+                "synON16M" = "red", "synON24M" = "red3",
+                "synlateON16M" = "royalblue1", "synlateON24M" = "blue")
+
+seurat_integrated$condition <- factor(seurat_integrated$condition, levels = c("synOFF6M", "synOFF16M", "synOFF24M",
+                                                                              "synON6M", "synON16M", "synON24M", 
+                                                                              "synlateON16M", "synlateON24M"))
+DimPlot(seurat_integrated, reduction = "umap", label = FALSE, repel = TRUE, label.size = 6, raster = FALSE, cols = condColors,
+        split.by = "condition", group.by = "condition", ncol = 3)+ ggtitle("") + NoLegend() +
+  guides(col=guide_legend(ncol =3,override.aes = list(size=4)))+
+  theme(legend.text = element_text(size = 15),
+        axis.line = element_line(size=0),
+        axis.text = element_text(size=0),
+        axis.ticks = element_line(size=0))
+
+
+## nUMI and nCell
+DefaultAssay(seurat_integrated) <- "SCT"
+
+gene_data <- FetchData(seurat_integrated, vars = c("Level1","CellLevel3","condition", "nCount_SCT", "nFeature_SCT","nUMI"))
+gene_data$condition <- factor(gene_data$condition, levels = c("synOFF6M", "synOFF16M", "synOFF24M",
+                                                              "synON6M", "synON16M", "synON24M", 
+                                                              "synlateON16M", "synlateON24M"))
+
+ggplot(gene_data, 
+       aes(x = condition, y = nUMI, fill = condition)) +
+  stat_boxplot(geom="errorbar") +
+  geom_boxplot(outlier.shape = NA,  alpha = 1) +
+  stat_summary(fun = mean, geom = "point", 
+               aes(fill = "grey60"),  # Add border color here
+               shape = 21,  # This shape supports both fill and color
+               size = 3, stroke = 1,color = "black") +  # Adjust `stroke` for border thickness
+  labs(title = paste("nUMI", "across Conditions"), 
+       x = "Cell Type and Treatment", 
+       y = "SCT normalized Log Expression Level") +
+  scale_fill_manual(values = condColors)+
+  scale_y_log10() +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 15),
+        axis.title.x = element_text(size = 0),
+        axis.text.y = element_text(size = 15),
+        axis.title.y = element_text(size = 20),
+        title = element_text(size = 20),
+        legend.position = "none")
+
+
+

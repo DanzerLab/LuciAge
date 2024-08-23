@@ -1,0 +1,253 @@
+# UMAP ----
+manColors_CellLevel3 <- c("GABA-Ano1/2 Neuron" = "dodgerblue", "GABA-Cemip Neuron" = "deepskyblue3", "GABA-Chst9 Neuron" = "dodgerblue4",
+                          "GABA-Etv1 Neuron" = "deepskyblue2", "GABA-Frem1 Neuron" = "darkslategray3", "GABA-Lamp5 Neuron" = "cyan3",
+                          "GABA-Otx2 Neuron" = "dodgerblue3", "GABA-Rgs9 Neuron" = "blue", "GABA-Rmst/Tshz2 Neuron" = "darkslategray4",
+                          "GABA-Six3 Neuron" = "dodgerblue2", "GABA-Sst Neuron" = "dodgerblue1", "GABA-Vip Neuron" = "deepskyblue1",
+                          
+                          "Vglut1-Bmpr1b Neuron" = "indianred3", "Vglut1-Cdh20 Neuron" = "tomato", "Vglut1-Col19a1 Neuron" = "orangered2",
+                          "Vglut1-Foxp2 Neuron" = "salmon3", "Vglut1-Mndal Neuron" = "tomato4", "Vglut1-Npas3 Neuron" = "orangered",
+                          "Vglut1-Oprk1 Neuron" = "violetred3", "Vglut1-Parm1 Neuron" = "tomato3", "Vglut1-Prox1 Neuron" = "red2",
+                          "Vglut1-Reln Neuron" = "salmon", "Vglut1-Rorb Neuron" = "orangered3", "Vglut1-Shc4 Neuron" = "red3",
+                          "Vglut1-Spag16 Neuron" = "indianred2", 
+                          "Vglut2-Nova1 Neuron" = "palevioletred4", "Vglut2-Synpo2 Neuron" = "palevioletred3",
+                          
+                          "Cholinergic Neuron" = "darkcyan","Dopaminergic Neuron" = "blueviolet",
+                          "Astrocyte" = "springgreen4", "Choroid Plexus" = "yellow3", "Microglia" = "plum3",
+                          "Oligodendrocyte" = "violetred2", "OPC" = "#F941D0", "Vascular Cell" = "tan2")
+
+
+DimPlot(seurat_integrated, reduction = "umap", label = FALSE, repel = TRUE, label.size = 6, raster = FALSE, 
+        cols = manColors_CellLevel3,
+        group.by = "CellLevel3")+guides(col=guide_legend(ncol =1,override.aes = list(size=4)))+ggtitle("Neurotransmitter")+ 
+  theme(legend.text = element_text(size = 15)) + NoLegend()
+
+# Annotation Marker ComplexHeatmap ----
+{
+  breaks <- c(-4,4)
+  colors <- c("grey10","yellow")
+  data <- FetchData(seurat_integrated, vars = c("CellLevel2","sample","CellLevel3",  "Rbfox3",
+                                                "Foxp2","Gng12","Tshz2","Cdh20","Parm1","Shoc1","Npas3","Ptpn14","Rerg","Mndal",
+                                                "Prox1","Prdm5","Reln","Rorb", "Oprk1", "Col24a1","Bmpr1b","Spag16","Shc4",
+                                                "Col19a1","Erbb4","Rgs9","Otx2","Rmst","Cemip","Nek7",
+                                                "Sst","Vip","Lamp5","Crispld1","Frem1","Chst9","Six3","Ano2","Etv1", 
+                                                "Enpp6","Acsbg1","Inpp5d","Pdgfra","Cped1","Ttr",
+                                                "Chat","Th","Slc17a6","Slc17a7","Gad2"), 
+                    slot = "data")
+  data$CellLevel3[which(data$CellLevel3 %in% c("Vglut2-Nova1 Neuron", "Vglut2-Synpo2 Neuron"))] <- "Vglut2 Neuron"
+  ## change group_by depending on which level we want
+  data_aggregated_CellLevel3 <- data %>%
+    group_by(sample, CellLevel3, CellLevel2) %>%
+    summarise(across(.cols = -c(0), # Skip the first two columns
+                     .fns = ~ mean(.x, na.rm = TRUE)),
+              .groups = 'drop') %>%
+    mutate(CellLevel3 = factor(CellLevel3, levels = c("Microglia","Vascular Cell", "Choroid Plexus","Astrocyte","Oligodendrocyte","OPC",
+                                                      "Cholinergic Neuron","Dopaminergic Neuron", "Vglut2 Neuron", 
+                                                      
+                                                      "GABA-Rgs9 Neuron", "GABA-Etv1 Neuron", "GABA-Chst9 Neuron", "GABA-Vip Neuron", "GABA-Ano1/2 Neuron",
+                                                      "GABA-Lamp5 Neuron", "GABA-Sst Neuron","GABA-Frem1 Neuron","GABA-Rmst/Tshz2 Neuron", "GABA-Cemip Neuron",
+                                                      "GABA-Otx2 Neuron", "GABA-Six3 Neuron",
+                                                      
+                                                      "Vglut1-Mndal Neuron","Vglut1-Oprk1 Neuron", "Vglut1-Bmpr1b Neuron","Vglut1-Prox1 Neuron",
+                                                      "Vglut1-Parm1 Neuron", "Vglut1-Npas3 Neuron", "Vglut1-Shc4 Neuron", "Vglut1-Col19a1 Neuron", 
+                                                      "Vglut1-Rorb Neuron",  "Vglut1-Reln Neuron", "Vglut1-Foxp2 Neuron", "Vglut1-Cdh20 Neuron", 
+                                                      "Vglut1-Spag16 Neuron"))) %>%
+    arrange(CellLevel3)
+  
+  CellLevel3_annotation <- data_aggregated_CellLevel3$CellLevel3
+  CellLevel2_annotation <- data_aggregated_CellLevel3$CellLevel2
+  
+  heatmap_matrix_CellLevel3 <- as.matrix(data_aggregated_CellLevel3[, -c(1:3)])
+  heatmap_matrix_CellLevel3 <- apply(heatmap_matrix_CellLevel3, 2, normalize_and_scale)
+  rownames(heatmap_matrix_CellLevel3) <- paste(data_aggregated_CellLevel3$sample, data_aggregated_CellLevel3$CellLevel2, sep = "_")
+  
+  # Create row annotation
+  CellLevel3_ann <- HeatmapAnnotation(df = data.frame(CellLevel3 = CellLevel3_annotation),
+                                      which = "row", # Specify this is a row annotation
+                                      col = list(CellLevel3 = c("GABA-Ano1/2 Neuron" = "dodgerblue", "GABA-Cemip Neuron" = "deepskyblue3", "GABA-Chst9 Neuron" = "dodgerblue4",
+                                                                "GABA-Etv1 Neuron" = "deepskyblue2", "GABA-Frem1 Neuron" = "darkslategray3", "GABA-Lamp5 Neuron" = "cyan3",
+                                                                "GABA-Otx2 Neuron" = "dodgerblue3", "GABA-Rgs9 Neuron" = "blue", "GABA-Rmst/Tshz2 Neuron" = "darkslategray4",
+                                                                "GABA-Six3 Neuron" = "dodgerblue2", "GABA-Sst Neuron" = "dodgerblue1", "GABA-Vip Neuron" = "deepskyblue1",
+                                                                
+                                                                "Vglut1-Bmpr1b Neuron" = "indianred3", "Vglut1-Cdh20 Neuron" = "tomato", "Vglut1-Col19a1 Neuron" = "orangered2",
+                                                                "Vglut1-Foxp2 Neuron" = "salmon3", "Vglut1-Mndal Neuron" = "tomato4", "Vglut1-Npas3 Neuron" = "orangered",
+                                                                "Vglut1-Oprk1 Neuron" = "violetred3", "Vglut1-Parm1 Neuron" = "tomato3", "Vglut1-Prox1 Neuron" = "red2",
+                                                                "Vglut1-Reln Neuron" = "salmon", "Vglut1-Rorb Neuron" = "orangered3", "Vglut1-Shc4 Neuron" = "red3",
+                                                                "Vglut1-Spag16 Neuron" = "indianred2",
+                                                                "Vglut2 Neuron" = "palevioletred2",
+                                                                "Cholinergic Neuron" = "darkcyan","Dopaminergic Neuron" = "blueviolet",
+                                                                "Astrocyte" = "springgreen4", "Choroid Plexus" = "yellow3", "Microglia" = "plum3",
+                                                                "Oligodendrocyte" = "violetred2", "OPC" = "#F941D0", "Vascular Cell" = "tan2")), 
+                                      simple_anno_size = unit(0.5, "cm"),# Adjust the size as needed
+                                      border = TRUE,
+                                      show_legend = TRUE, show_annotation_name = FALSE) 
+  
+  
+  CellLevel2_ann <- HeatmapAnnotation(df = data.frame(CellLevel2 = CellLevel2_annotation),
+                                      which = "row", # Specify this is a row annotation
+                                      col = list(CellLevel2 = c("GABAergic Neuron" = "darkblue", "Vglut1 Neuron" = "darkred", "Vglut2 Neuron" = "palevioletred2",
+                                                                "Cholinergic Neuron" = "darkcyan","Dopaminergic Neuron" = "blueviolet",
+                                                                "Astrocyte" = "springgreen4", "Choroid Plexus" = "yellow3", "Microglia" = "plum3",
+                                                                "Oligodendrocyte" = "violetred2", "OPC" = "#F941D0", "Vascular Cell" = "tan2")), 
+                                      simple_anno_size = unit(0.5, "cm"),# Adjust the size as needed
+                                      border = TRUE,
+                                      show_legend = TRUE, show_annotation_name = FALSE) 
+  
+  
+  desired_column_order_CL3 <- c("Inpp5d","Cped1","Ttr","Acsbg1","Enpp6","Pdgfra","Chat","Th","Slc17a6","Gad2","Slc17a7",
+                                "Rgs9","Etv1","Chst9","Vip","Ano2","Lamp5","Sst","Frem1","Rmst","Cemip","Otx2","Six3",
+                                "Mndal","Oprk1","Bmpr1b","Prox1","Parm1","Npas3","Shc4","Col19a1","Rorb","Reln","Foxp2","Cdh20","Spag16"
+  )
+  heatmap_matrix_CellLevel3 <- heatmap_matrix_CellLevel3[, desired_column_order_CL3]
+  # Create the heatmap with row annotation
+  print(Heatmap(heatmap_matrix_CellLevel3,
+                name = "Expression",
+                row_names_gp = gpar(fontsize = 10),
+                column_names_gp = gpar(fontsize = 10),
+                show_row_names = FALSE,
+                show_column_names = TRUE,
+                show_row_dend = FALSE,
+                cluster_rows = FALSE,
+                cluster_columns = FALSE,
+                row_title = "Celltype",
+                use_raster = FALSE,
+                left_annotation = CellLevel2_ann,
+                col = colorRamp2(breaks, colors))
+  )
+  
+  ### Glut1
+  data_aggregated_CellLevel3_NA_glut <- data_aggregated_CellLevel3
+  data_aggregated_CellLevel3_NA_glut[-which(data_aggregated_CellLevel3_NA_glut$CellLevel2 == "Vglut1 Neuron"),-c(1:3)] <- NA
+  data_aggregated_CellLevel3_NA_glut[,-c(1:3,which(colnames(data_aggregated_CellLevel3_NA_glut) %in% 
+                                                     c( "Mndal","Oprk1","Bmpr1b","Prox1","Parm1","Npas3","Shc4","Col19a1",
+                                                        "Rorb","Reln","Foxp2","Cdh20","Spag16")))] <- NA
+  
+  heatmap_matrix_CellLevel3_glut <- as.matrix(data_aggregated_CellLevel3_NA_glut[, -c(1:3)])
+  heatmap_matrix_CellLevel3_glut <- apply(heatmap_matrix_CellLevel3_glut, 2, normalize_and_scale)
+  rownames(heatmap_matrix_CellLevel3_glut) <- paste(data_aggregated_CellLevel3_NA_glut$sample, data_aggregated_CellLevel3_NA_glut$CellLevel2, sep = "_")
+  heatmap_matrix_CellLevel3_glut <- heatmap_matrix_CellLevel3_glut[, desired_column_order_CL3]
+  
+  print(Heatmap(heatmap_matrix_CellLevel3_glut,
+                name = "Expression",
+                row_names_gp = gpar(fontsize = 10),
+                column_names_gp = gpar(fontsize = 10),
+                show_row_names = FALSE,
+                show_column_names = TRUE,
+                show_row_dend = FALSE,
+                cluster_rows = FALSE,
+                cluster_columns = FALSE,
+                row_title = "Celltype",
+                use_raster = FALSE,
+                left_annotation = CellLevel3_ann,
+                col = colorRamp2(breaks, colors)) 
+  )
+  
+  ### GABA
+  data_aggregated_CellLevel3_NA_GABA <- data_aggregated_CellLevel3
+  data_aggregated_CellLevel3_NA_GABA[-which(data_aggregated_CellLevel3_NA_GABA$CellLevel2 == "GABAergic Neuron"),-c(1:3)] <- NA
+  data_aggregated_CellLevel3_NA_GABA[,-c(1:3,which(colnames(data_aggregated_CellLevel3_NA_GABA) %in% 
+                                                     c("Rgs9","Etv1","Chst9","Vip","Ano2","Lamp5","Sst",
+                                                       "Frem1","Rmst","Cemip","Otx2","Six3")))] <- NA
+  
+  heatmap_matrix_CellLevel3_GABA <- as.matrix(data_aggregated_CellLevel3_NA_GABA[, -c(1:3)])
+  heatmap_matrix_CellLevel3_GABA <- apply(heatmap_matrix_CellLevel3_GABA, 2, normalize_and_scale)
+  rownames(heatmap_matrix_CellLevel3_GABA) <- paste(data_aggregated_CellLevel3_NA_GABA$sample, data_aggregated_CellLevel3_NA_GABA$CellLevel2, sep = "_")
+  heatmap_matrix_CellLevel3_GABA <- heatmap_matrix_CellLevel3_GABA[, desired_column_order_CL3]
+  print(Heatmap(heatmap_matrix_CellLevel3_GABA,
+                name = "Expression",
+                row_names_gp = gpar(fontsize = 10),
+                column_names_gp = gpar(fontsize = 10),
+                show_row_names = FALSE,
+                show_column_names = TRUE,
+                show_row_dend = FALSE,
+                cluster_rows = FALSE,
+                cluster_columns = FALSE,
+                column_names_side = 
+                  row_title = "Celltype",
+                use_raster = FALSE,
+                left_annotation = CellLevel3_ann,
+                col = colorRamp2(breaks, colors))
+  )# Add your annotation object here
+  dev.off()
+}
+
+
+breaks <- c(-4,4)
+colors <- c("grey10","yellow")
+data <- FetchData(seurat_integrated, vars = c("CellLevel2","sample",
+                                              "Enpp6","Acsbg1","Inpp5d","Pdgfra","Cped1","Ttr",
+                                              "Chat","Th","Slc17a6","Slc17a7","Gad2"), 
+                  slot = "data")
+data_aggregated_CellLevel2 <- data %>%
+  group_by(sample, CellLevel2) %>%
+  summarise(across(.cols = -c(0), # Skip the first two columns
+                   .fns = ~ mean(.x, na.rm = TRUE)),
+            .groups = 'drop') %>%
+  #right_join(data[c("AnnoLevel","sample","CellLevel3")], by = c("sample","CellLevel3")) %>%
+  mutate(CellLevel2 = factor(CellLevel2, levels = c("Microglia","Vascular Cell", "Choroid Plexus","Astrocyte","Oligodendrocyte","OPC",
+                                                    "Cholinergic Neuron","Dopaminergic Neuron", "Vglut2 Neuron", 
+                                                    
+                                                    "GABAergic Neuron",
+                                                    
+                                                    "Vglut1 Neuron"))) %>%
+  arrange(CellLevel2)
+
+CellLevel2_annotation <- data_aggregated_CellLevel2$CellLevel2
+CellLevel2_ann <- HeatmapAnnotation(df = data.frame(CellLevel2 = CellLevel2_annotation),
+                                    which = "row", # Specify this is a row annotation
+                                    col = list(CellLevel2 = c("GABAergic Neuron" = "darkblue", "Vglut1 Neuron" = "darkred", "Vglut2 Neuron" = "palevioletred2",
+                                                              "Cholinergic Neuron" = "darkcyan","Dopaminergic Neuron" = "blueviolet",
+                                                              "Astrocyte" = "springgreen4", "Choroid Plexus" = "yellow3", "Microglia" = "plum3",
+                                                              "Oligodendrocyte" = "violetred2", "OPC" = "#F941D0", "Vascular Cell" = "tan2")), 
+                                    simple_anno_size = unit(0.5, "cm"),# Adjust the size as needed
+                                    border = TRUE,
+                                    show_legend = TRUE, show_annotation_name = FALSE) 
+heatmap_matrix_CellLevel2 <- as.matrix(data_aggregated_CellLevel2[, -c(1:2)])
+heatmap_matrix_CellLevel2 <- apply(heatmap_matrix_CellLevel2, 2, normalize_and_scale)
+rownames(heatmap_matrix_CellLevel2) <- paste(data_aggregated_CellLevel2$sample, data_aggregated_CellLevel2$CellLevel2, sep = "_")
+
+desired_column_order_CL2 <- c("Inpp5d","Cped1","Ttr","Acsbg1","Enpp6","Pdgfra","Chat","Th","Slc17a6","Gad2","Slc17a7"
+)
+heatmap_matrix_CellLevel2 <- heatmap_matrix_CellLevel2[, desired_column_order_CL2]
+# Create the heatmap with row annotation
+print(Heatmap(heatmap_matrix_CellLevel2,
+              name = "Expression",
+              row_names_gp = gpar(fontsize = 10),
+              column_names_gp = gpar(fontsize = 10),
+              show_row_names = FALSE,
+              show_column_names = TRUE,
+              show_row_dend = FALSE,
+              cluster_rows = FALSE,
+              cluster_columns = FALSE,
+              row_title = "Celltype",
+              use_raster = FALSE,
+              left_annotation = CellLevel2_ann,
+              col = colorRamp2(breaks, colors))
+)
+# make circular dendogramm ----
+DefaultAssay(seurat_integrated)
+Idents(seurat_integrated) <- "CellLevel2"
+seurat_integrated <- BuildClusterTree(seurat_integrated, dims = 1:30, reduction = "harmony", reorder = FALSE)
+dend <- Tool(seurat_integrated, slot ="BuildClusterTree")
+dend$tip.label <- c("CHOR", "ASC", "OLG", "VSC", "Chol-Neuron", "MGL", "OPC", "Dopa-Neuron", "Vglut2-Neuron", "GABA-Neuron", "Vglut1-Neuron")
+
+p <- ggtree::ggtree(dend, layout='circular') + 
+  #ggtree::geom_highlight(mapping=aes(subset = node %in% c(6:11)), fill = c("#F941D0","plum3","tan2","violetred2","springgreen4","yellow3"), alpha = 0.7)+
+  #ggtree::geom_highlight(mapping=aes(subset = node %in% c(1:5)), fill = c("darkcyan","blueviolet","darkblue","darkred","palevioletred2"), alpha= 0.7)+
+  #ggtree::geom_tiplab(size = 6) +
+  ggtree::geom_tippoint() + ggtree::geom_tree(layout='circular')
+p+ geom_rect(data = dplyr::filter(p$data, node %in% c(1)), aes(x = x, y = y), color = "red", size = 3)
+{
+  p2 <- ggtree::rotate(p, 17)
+  #p2
+  p3 <- ggtree::rotate(p2,16)
+  #p3
+  p4 <- ggtree::rotate(p3, 19)
+  #p4
+  p5 <- ggtree::rotate(p4,21)
+  #p5
+  p6 <- ggtree::rotate(p5, 20)
+  #p6
+  p7 <- ggtree::rotate(p6, 12)
+  p7
+}
+

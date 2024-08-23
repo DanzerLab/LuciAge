@@ -1,0 +1,39 @@
+# PD_info_df should be a dataframe with the columns celltype, nUMI, and Nsigres for ON vs OFF comparisons
+
+PD_info_df <- PD_info_df %>%
+  group_by(celltype) %>%
+  summarise(nUMI_sum = sum(nUMI, na.rm = TRUE),  # Sum nUMI values, remove NA values if any
+            Nsigres_sum = sum(Nsigres, na.rm = TRUE))
+model <- lm(Nsigres_sum ~ nUMI_sum, data = PD_info_df)
+PD_info_df$predicted_Nsigres_sum <- predict(model, newdata = PD_info_df)
+PD_info_df$residuals <- PD_info_df$Nsigres_sum - PD_info_df$predicted_Nsigres_sum
+top_positive_residuals <- PD_info_df %>%
+  dplyr::filter(residuals > 0) %>%
+  arrange(desc(residuals))
+
+manColors_CellLevel3 <- c("GABA-Ano1/2 Neuron" = "dodgerblue", "GABA-Cemip Neuron" = "deepskyblue3", "GABA-Chst9 Neuron" = "dodgerblue4",
+                          "GABA-Etv1 Neuron" = "deepskyblue2", "GABA-Frem1 Neuron" = "darkslategray3", "GABA-Lamp5 Neuron" = "cyan3",
+                          "GABA-Otx2 Neuron" = "dodgerblue3", "GABA-Rgs9 Neuron" = "blue", "GABA-Rmst/Tshz2 Neuron" = "darkslategray4",
+                          "GABA-Six3 Neuron" = "dodgerblue2", "GABA-Sst Neuron" = "dodgerblue1", "GABA-Vip Neuron" = "deepskyblue1",
+                          
+                          "Vglut1-Bmpr1b Neuron" = "indianred3", "Vglut1-Cdh20 Neuron" = "tomato", "Vglut1-Col19a1 Neuron" = "orangered2",
+                          "Vglut1-Foxp2 Neuron" = "salmon3", "Vglut1-Mndal Neuron" = "tomato4", "Vglut1-Npas3 Neuron" = "orangered",
+                          "Vglut1-Oprk1 Neuron" = "violetred3", "Vglut1-Parm1 Neuron" = "tomato3", "Vglut1-Prox1 Neuron" = "red2",
+                          "Vglut1-Reln Neuron" = "salmon", "Vglut1-Rorb Neuron" = "orangered3", "Vglut1-Shc4 Neuron" = "red3",
+                          "Vglut1-Spag16 Neuron" = "indianred2", 
+                          "Vglut2-Nova1 Neuron" = "palevioletred4", "Vglut2-Synpo2 Neuron" = "palevioletred3",
+                          
+                          "Cholinergic Neuron" = "darkcyan","Dopaminergic Neuron" = "blueviolet",
+                          "Astrocyte" = "springgreen4", "Choroid Plexus" = "yellow3", "Microglia" = "plum3",
+                          "Oligodendrocyte" = "violetred2", "OPC" = "#F941D0", "Vascular Cell" = "tan2")
+
+ggplot(PD_info_df, aes(x = nUMI_sum, y = Nsigres_sum, col = celltype)) +
+  geom_point(size = 10) +  # Plot the data points
+  geom_smooth(method = "lm", col = "red") +  # Add the linear regression line, without confidence interval
+  geom_text_repel(aes(label = celltype), repel = TRUE, check_overlap = TRUE, size = 0) +  # Add labels
+  labs(x = "Sum nUMI", y = "Number of differentially expressed genes", title = "Comparing number of significant hits to nUMI for all ON vs OFF comparisons") +
+  scale_color_manual(values = manColors_CellLevel3, name = "Celltype") + 
+  theme_minimal() + # Use a minimal theme for a cleaner look
+  theme(plot.title = element_text(size = 25, face = "bold"),
+        axis.title = element_text(size = 15),
+        legend.position = "none")

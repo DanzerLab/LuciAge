@@ -1,0 +1,43 @@
+# See MassSpec code for the objects
+
+plot_frequency(data_se)+
+    theme(plot.title = element_text(size = 25, face = "bold"),
+          axis.title = element_text(size = 15))
+  #plot_numbers(data_se[,which(data_se$condition == "OFF6M")]) # maybe just for batches
+  plot_numbers_custom(data_se[,which(data_se$condition == "OFF6M")])+
+    theme(plot.title = element_text(size = 25),
+          axis.title = element_text(size = 15),
+          axis.text.x = element_text(size = 15),
+          legend.text = element_text(size=15),
+          legend.title = element_text(size=15))
+  plot_normalization(data_filt, data_norm)+
+    theme(strip.text = element_text(size = 25),
+          axis.title = element_text(size = 15),
+          legend.text = element_text(size=15),
+          legend.title = element_text(size=15))
+  plot_imputation(data_norm, data_imp)+
+    theme(strip.text = element_text(size = 25),
+          axis.title = element_text(size = 15),
+          legend.text = element_text(size=15),
+          legend.title = element_text(size=15))
+  p.pca <- plot_pca(data_filt, x = 1, y = 2, indicate = c("condition", "batch"), 
+                    n = 500, # use all detected proteins
+                    point_size = 10, label=F)+
+    theme(plot.title = element_text(size = 25),
+          axis.title = element_text(size = 15),
+          legend.text = element_text(size=15),
+          legend.title = element_text(size=15))
+  p.pca # this with plot_numbers?
+  
+  mat <- assay(data_imp)
+  mm <- model.matrix(~condition, colData(data_imp))
+  mat <- limma::removeBatchEffect(mat, batch1=data_imp$sex, batch2 = data_imp$batch, design=mm)
+  data_imp_noBatch <- data_imp
+  assay(data_imp_noBatch) <- mat
+  plot_pca(data_imp_noBatch, x = 1, y = 2, indicate = c("condition", "batch"), 
+           n = 500, # use all detected proteins
+           point_size = 10, label=F)+
+    theme(plot.title = element_text(size = 25),
+          axis.title = element_text(size = 15),
+          legend.text = element_text(size=15),
+          legend.title = element_text(size=15))

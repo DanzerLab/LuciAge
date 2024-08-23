@@ -1,0 +1,2082 @@
+# PIDC pipeline
+library(readxl)
+library(qs)
+library(Seurat)
+library(igraph)
+library(OmnipathR)
+library(dplyr)
+library(magrittr)
+library(sva)
+library(ggplot2)
+library(reshape2)
+library(ComplexHeatmap)
+library(org.Mm.eg.db)
+library(circlize)
+library(ggraph)
+library(igraph)
+library(STRINGdb)
+library(ComplexHeatmap)
+library(forcats)
+# Functions ----
+# Function to calculate the number of edges between two topics
+count_edges_between_topics <- function(graph, topic1, topic2) {
+  edges <- E(graph)[from(V(graph)[topic == topic1]) & to(V(graph)[topic == topic2])]
+  return(length(edges))
+}
+place_in_circle <- function(center_x, center_y, num_points, radius = 1) {
+  angles <- seq(from = 0, to = 2 * pi, length.out = num_points + 1)
+  angles <- angles[-length(angles)]  # Remove the last point because it's the same as the first
+  x <- center_x + radius * cos(angles)
+  y <- center_y + radius * sin(angles)
+  return(data.frame(x = x, y = y))
+}
+calculate_positions <- function(n, center = c(0, 0), radius = c(1, 1)) {
+  angles <- seq(0, 2 * pi, length.out = n + 1)
+  x <- center[1] + radius[1] * cos(angles)
+  y <- center[2] + radius[2] * sin(angles)
+  data.frame(x = x[-length(x)], y = y[-length(y)]) # Remove the last point because it's the same as the first
+}
+scale_column <- function(column) {
+  # Apply the scaling formula
+  scaled_column = -4 + ((column - min(column)) * (8)) / (max(column) - min(column))
+  return(scaled_column)
+}
+get_STRING_dataframe <- function(string_db, geneSet){
+  STRING_rows_df <- data.frame(
+    source = character(),
+    target = character(),
+    source_genesymbol = character(),
+    target_genesymbol = character(),
+    consensus_stimulation = numeric(),
+    consensus_inhibition = numeric(),
+    sources = character(),
+    type = character(),
+    stringsAsFactors = FALSE # Avoid converting strings to factors
+  )
+  for (gene in geneSet){
+    print(paste0("Getting STRING Interactions for ", gene))
+    string_gene = string_db$mp(gene)
+    gene_interact <- string_db$get_neighbors(string_gene)
+    gene_interact <- sapply(gene_interact, function(id) {
+      gene_name <- string_db$`.->proteins`$preferred_name[which(string_db$`.->proteins`$protein_external_id == id)]
+      if(length(gene_name) > 0) return(gene_name) else return(NA)
+    })
+    rows_to_add <- purrr::map_dfr(gene_interact, function(interact_gene) {
+      # Define values for each column as needed. Modify column values as per your requirement.
+      data.frame(
+        source = c(gene,interact_gene),
+        target = c(interact_gene,gene),
+        source_genesymbol = c(gene, interact_gene),
+        target_genesymbol = c(interact_gene, gene),
+        consensus_stimulation = c(0,0), # Specify if needed
+        consensus_inhibition = c(0,0), # Specify if needed
+        sources = c("STRING", "STRING"), # Specify if needed
+        type = c("PPI","PPI") # Specify if needed
+      )
+    })
+    STRING_rows_df <- rbind(STRING_rows_df, rows_to_add)
+  }
+  return(STRING_rows_df)
+}
+get_vertex_color <- function(gene_name, PD_late, PD_mid, PD_early) {
+  in_set1 <- gene_name %in% PD_late
+  in_set2 <- gene_name %in% PD_mid
+  in_set3 <- gene_name %in% PD_early
+  
+  if (in_set1) {
+    return("PD_late") # Color for genes in all three gene sets
+  } else if (in_set2) {
+    return("PD_mid") # Color for genes in gene sets 1 and 2
+  } else if (in_set3) {
+    return("PD_early") # Color for genes in gene sets 1 and 3
+  } else {
+    return("None") # Color for genes in none of the gene sets
+  }
+}
+oraNetwork <- function(geneSet, db, ora_df, type){
+  if (type != "Source" && type != "Target" && type != "Both"){
+    print("Invalid type value! Use Source or Target instead!")
+  }
+  
+  genes <- intersect(geneSet, unique(c(db$source_genesymbol, db$target_genesymbol)))
+  g <- interaction_graph(interactions = database)
+  all_edges <- c()
+  for (gene in genes) {
+    print(gene)
+    # Find the neighborhood of the current gene within distance 2
+    neighborhood_genes <- unlist(neighborhood(graph = g, order = 2, nodes = gene, mode = "out"))
+    neighborhood_gene_names <- V(g)[neighborhood_genes]$name
+    filtered_neighborhood_genes <- neighborhood_gene_names[neighborhood_gene_names %in% genes]
+    for (neighbor_gene in filtered_neighborhood_genes) {
+      if (neighbor_gene != gene) { # Ensure we don't calculate a path to itself
+        sp <- shortest_paths(g, from = gene, to = neighbor_gene, mode = "out", algorithm = "unweighted", output = "both")
+        
+        # If path length is up to 2, prepare the edges for this path
+        if (!is.null(sp$vpath[[1]]) && length(sp$vpath[[1]]) <= 3) {
+          path_edges <- sp$epath[[1]]
+          all_edges <- c(all_edges, path_edges)
+        }
+      }
+    }
+  }
+  all_edges <- unique(all_edges)
+  subgraph_g <- subgraph.edges(g, eids = all_edges, delete.vertices = TRUE)
+  source_target <- as.data.frame(ends(subgraph_g, E(subgraph_g)))
+  popSize <- nrow(db)
+  sampleSize <- length(E(subgraph_g))
+  oraRes_df <- data.frame(
+    gene = character(),
+    geneRatio = character(),
+    bgRatio = character(),
+    pValue = numeric(),
+    geneID = character(),
+    count = integer()
+  )
+  if (type == "Source"){
+    for (gene in unique(V(subgraph_g)$name)){
+      if (gene %in% ora_df$source_genesymbol){
+        Ypop <- ora_df$length_of_list[[which(ora_df$source_genesymbol == gene)]]
+        Ysample <- length(source_target$V1[which(source_target$V1== gene)])
+        if (Ypop >= 10){
+          pval <- phyper(Ysample-1, Ypop, popSize-Ypop, sampleSize, lower.tail = FALSE)
+          temp_df <- data.frame(
+            gene = gene,
+            geneRatio = paste0(Ysample, "/", sampleSize),
+            bgRatio = paste0(Ypop, "/", popSize),
+            pValue = pval,
+            geneID = paste(source_target$V2[which(source_target$V1== gene)], collapse = "/"),
+            count = Ysample
+          )
+        }else if (Ypop < 10){
+          pval <- 1
+          temp_df <- data.frame(
+            gene = gene,
+            geneRatio = paste0(Ysample, "/", sampleSize),
+            bgRatio = paste0(Ypop, "/", popSize),
+            pValue = pval,
+            geneID = paste(source_target$V2[which(source_target$V1== gene)], collapse = "/"),
+            count = Ysample
+          )
+        }
+        oraRes_df <- rbind(oraRes_df, temp_df)
+      }
+    }
+    oraRes_df$pAdj <- p.adjust(oraRes_df$pValue, method = "BH")
+    oraRes_df$pAdj[which(oraRes_df$pValue == 10)] <- 10
+  } else if (type == "Target"){
+    for (gene in unique(V(subgraph_g)$name)){
+      if (gene %in% ora_df$target_genesymbol){
+        Ypop <- ora_df$length_of_list[[which(ora_df$target_genesymbol == gene)]]
+        Ysample <- length(source_target$V2[which(source_target$V2== gene)])
+        if (Ypop >= 10){
+          pval <- phyper(Ysample-1, Ypop, popSize-Ypop, sampleSize, lower.tail = FALSE)
+          temp_df <- data.frame(
+            gene = gene,
+            geneRatio = paste0(Ysample, "/", sampleSize),
+            bgRatio = paste0(Ypop, "/", popSize),
+            pValue = pval,
+            geneID = paste(source_target$V1[which(source_target$V2== gene)], collapse = "/"),
+            count = Ysample
+          )
+        }else if (Ypop < 10){
+          pval <- 1
+          temp_df <- data.frame(
+            gene = gene,
+            geneRatio = paste0(Ysample, "/", sampleSize),
+            bgRatio = paste0(Ypop, "/", popSize),
+            pValue = pval,
+            geneID = paste(source_target$V2[which(source_target$V1== gene)], collapse = "/"),
+            count = Ysample
+          )
+        }
+        oraRes_df <- rbind(oraRes_df, temp_df)
+      }
+    }
+    oraRes_df$pAdj <- p.adjust(oraRes_df$pValue, method = "BH")
+    oraRes_df$pAdj[which(oraRes_df$pValue == 10)] <- 10
+  }else if (type == "Both"){
+    for (gene in unique(V(subgraph_g)$name)){
+      if (gene %in% ora_df$gene){
+        Ypop <- ora_df$combined_length[[which(ora_df$gene == gene)]]
+        Ysample <- length(source_target$V2[which(source_target$V2== gene)])
+        if (Ypop >= 10){
+          pval <- phyper(Ysample-1, Ypop, popSize-Ypop, sampleSize, lower.tail = FALSE)
+          temp_df <- data.frame(
+            gene = gene,
+            geneRatio = paste0(Ysample, "/", sampleSize),
+            bgRatio = paste0(Ypop, "/", popSize),
+            pValue = pval,
+            geneID = paste(source_target$V1[which(source_target$V2== gene)], collapse = "/"),
+            count = Ysample
+          )
+        }else if (Ypop < 10){
+          pval <- 1
+          temp_df <- data.frame(
+            gene = gene,
+            geneRatio = paste0(Ysample, "/", sampleSize),
+            bgRatio = paste0(Ypop, "/", popSize),
+            pValue = pval,
+            geneID = paste(source_target$V2[which(source_target$V1== gene)], collapse = "/"),
+            count = Ysample
+          )
+        }
+        oraRes_df <- rbind(oraRes_df, temp_df)
+      }
+    }
+    oraRes_df$pAdj <- p.adjust(oraRes_df$pValue, method = "BH")
+    oraRes_df$pAdj[which(oraRes_df$pValue == 10)] <- 10
+  }
+  
+  return(oraRes_df)
+}
+database_Network_ora <- function(database, geneSet, geneSet_name, n_hits,
+                                 master_df,layout, plotTitle = "NoTitle", showZero = FALSE){
+  
+  genes <- intersect(c(geneSet), unique(c(database$source_genesymbol, database$target_genesymbol)))
+  g <- interaction_graph(interactions = database)
+  all_edges <- c()
+  for (gene in genes) {
+    print(gene)
+    # Find the neighborhood of the current gene within distance 2
+    neighborhood_genes <- unlist(neighborhood(graph = g, order = 2, nodes = gene, mode = "out"))
+    neighborhood_gene_names <- V(g)[neighborhood_genes]$name
+    filtered_neighborhood_genes <- neighborhood_gene_names[neighborhood_gene_names %in% genes]
+    for (neighbor_gene in filtered_neighborhood_genes) {
+      if (neighbor_gene != gene) { # Ensure we don't calculate a path to itself
+        sp <- shortest_paths(g, from = gene, to = neighbor_gene, mode = "out", algorithm = "unweighted", output = "both")
+        
+        # If path length is up to 2, prepare the edges for this path
+        if (!is.null(sp$vpath[[1]]) && length(sp$vpath[[1]]) <= 3) {
+          path_edges <- sp$epath[[1]]
+          all_edges <- c(all_edges, path_edges)
+        }
+      }
+    }
+  }
+  all_edges <- unique(all_edges)
+  subgraph_g <- subgraph.edges(g, eids = all_edges, delete.vertices = TRUE)
+  subgraph_g <- as.directed(subgraph_g, mode = "mutual")
+  
+  if (showZero == TRUE){
+    isolated_genes <- setdiff(genes, V(subgraph_g)$name)
+    # Add isolated genes as vertices to 'subgraph_g'
+    for (gene in isolated_genes) {
+      subgraph_g <- add_vertices(subgraph_g, 1, name = gene)
+    }
+  }
+  # Prepare a named vector of colors based on the desiredComp values
+  ora_df_target <- master_df[which(master_df$geneSetName == geneSet_name & master_df$Direction == "Target"),]
+  ora_df_source <- master_df[which(master_df$geneSetName == geneSet_name & master_df$Direction == "Source"),]
+  ora_df_both <- master_df[which(master_df$geneSetName == geneSet_name & master_df$Direction == "Both"),]
+  top_target <- ora_df_target %>%
+    arrange(pAdj) %>%
+    slice_head(n = n_hits) %>%
+    dplyr::filter(count > 2)%>%
+    pull(gene)
+  top_source <- ora_df_source %>%
+    arrange(pAdj) %>%
+    slice_head(n = n_hits)%>%
+    dplyr::filter(count > 2)%>%
+    pull(gene)
+  top_central <- ora_df_both %>%
+    arrange(pAdj) %>%
+    slice_head(n = 20)%>%
+    dplyr::filter(count > 2)%>%
+    pull(gene)
+  
+  centrality_df <- data.frame(
+    gene = V(subgraph_g)$name,
+    degree = igraph::degree(subgraph_g),
+    eigen = evcent(subgraph_g)$vector,
+    betweenness = betweenness(subgraph_g, directed = FALSE)
+  )
+  centrality_df$degree_rank <- rank(-centrality_df$degree, ties.method = "min")
+  centrality_df$eigen_rank <- rank(-centrality_df$eigen, ties.method = "min")
+  centrality_df$betweenness_rank <- rank(-centrality_df$betweenness, ties.method = "min")
+  centrality_df$centrality <- rowMeans(centrality_df[,c("degree_rank", "eigen_rank", "betweenness_rank")])
+  
+  V(subgraph_g)$centrality <- centrality_df$centrality
+  V(subgraph_g)$regulator <- ifelse(V(subgraph_g)$name %in% top_central, "Regulator", "No Info")
+  #V(subgraph_g)$color <- sapply(V(subgraph_g)$name, get_vertex_color, signatures_list$PD_late, signatures_list$PD_mid, signatures_list$PD_early)
+  V(subgraph_g)$color <- ifelse(V(subgraph_g)$name %in% top_target & V(subgraph_g)$name %in% top_source, "Both",
+                                ifelse(V(subgraph_g)$name %in% top_target, "Downstream",
+                                       ifelse(V(subgraph_g)$name %in% top_source, "Upstream", "No Info"))
+  )
+  #V(subgraph_g)$text_color <- sapply(V(subgraph_g)$name, get_vertex_color, PIDCgraph_list$PD_late_intersect, PIDCgraph_list$PD_mid_intersect, PIDCgraph_list$PD_early)
+  V(subgraph_g)$text_color <- ifelse(V(subgraph_g)$name %in% genes, "PIDC", "None")
+  #V(subgraph_g)$centrality <- sapply(V(subgraph_g)$name, function(vertex_name) assign_centrality(subgraph_g, vertex_name))
+  
+  E(subgraph_g)$color <- ifelse(E(subgraph_g)$consensus_stimulation == 1, "Stimulation", 
+                                ifelse(E(subgraph_g)$consensus_inhibition == 1, "Inhibition", "Unknown"))
+  
+  plot_direction <- ggraph(subgraph_g, layout = layout) + 
+    geom_edge_link(aes(color = E(subgraph_g)$color,start_cap = label_rect(node1.name),
+                       end_cap = label_rect(node2.name)), 
+                   arrow = arrow(type = "closed", length = unit(4, "mm"))) +
+    geom_node_label(aes(label = name, fill = V(subgraph_g)$color, col = text_color),
+                    repel = FALSE, alpha = 0.6,size = 5) +
+    #scale_fill_manual(values = c("PD_late" = "palegreen3","PD_mid" = "lightsalmon4","PD_early" = "slateblue","None" = "grey50"),name = "Gene Source") + 
+    scale_fill_manual(values = c("Downstream" = "blue", "Upstream" = "red", "Both" = "darkorchid1","No Info" = "grey50"), name = "Regulators") +
+    scale_color_manual(values = c("PIDC"= "gold", "None" = "black"), 
+                       name = "PIDC core") +
+    #scale_size_manual(values = c())+
+    scale_edge_color_manual(values = c("Stimulation" = "red", "Inhibition" = "blue", "Unknown" = "black"),
+                            name = "Interaction Type") +
+    theme_graph() + 
+    ggtitle(plotTitle) +
+    theme(text = element_text(family = "Times", size = 15), 
+          plot.title = element_text(family = "Times", size = 20)) 
+  
+  plot_reg <- ggraph(subgraph_g, layout = layout) + 
+    geom_edge_link(aes(color = E(subgraph_g)$color,start_cap = label_rect(node1.name),
+                       end_cap = label_rect(node2.name)), 
+                   arrow = arrow(type = "closed", length = unit(4, "mm"))) +
+    geom_node_label(aes(label = name, fill = V(subgraph_g)$regulator, col = text_color),
+                    repel = FALSE, alpha = 0.6,size = 5) +
+    #scale_fill_manual(values = c("PD_late" = "palegreen3","PD_mid" = "lightsalmon4","PD_early" = "slateblue","None" = "grey50"),name = "Gene Source") + 
+    scale_fill_manual(values = c("Regulator" = "orange", "No Info" = "grey50"), name = "Regulators") +
+    scale_color_manual(values = c("PIDC"= "gold", "None" = "black"), 
+                       name = "PIDC core") +
+    #scale_size_manual(values = c())+
+    scale_edge_color_manual(values = c("Stimulation" = "red", "Inhibition" = "blue", "Unknown" = "black"),
+                            name = "Interaction Type") +
+    theme_graph() + 
+    ggtitle(plotTitle) +
+    theme(text = element_text(family = "Times", size = 15), 
+          plot.title = element_text(family = "Times", size = 20)) 
+  return(list(graph = subgraph_g, plot_direction = plot_direction, plot_reg = plot_reg))
+}
+bridge_network <- function(database, gene_source, gene_target, layout = "stress", plotTitle = "NoTitle",
+                           showZero = FALSE){
+  
+  genes_source <- intersect(c(gene_source), unique(c(database$source_genesymbol, database$target_genesymbol)))
+  genes_target <- intersect(c(gene_target), unique(c(database$source_genesymbol, database$target_genesymbol)))
+  OPI_g <- interaction_graph(interactions = database)
+  all_edges <- c()
+  for (i in 1:length(genes_source)) {
+    for (j in 1:length(genes_target)) {
+      sp <- shortest_paths(OPI_g, from = genes_source[i], to = genes_target[j], output = "epath")
+      if (!is.null(sp$epath[[1]]) && length(sp$epath[[1]]) %in% c(1,2)) {
+        path_edges <- sp$epath[[1]]
+        all_edges <- c(all_edges, path_edges)
+      }
+    }
+  }
+  all_edges <- unique(all_edges)
+  subgraph_g <- subgraph.edges(OPI_g, eids = all_edges, delete.vertices = TRUE)
+  subgraph_g <- as.directed(subgraph_g, mode = "mutual")
+  
+  V(subgraph_g)$text_color <- sapply(V(subgraph_g)$name, get_vertex_color, PIDCgraph_list$PD_late_intersect, PIDCgraph_list$PD_mid_intersect, PIDCgraph_list$PD_early)
+  #V(subgraph_g)$centrality <- sapply(V(subgraph_g)$name, function(vertex_name) assign_centrality(subgraph_g, vertex_name))
+  
+  
+  E(subgraph_g)$color <- ifelse(E(subgraph_g)$consensus_stimulation == 1, "Stimulation", 
+                                ifelse(E(subgraph_g)$consensus_inhibition == 1, "Inhibition", "Unknown"))
+  
+  plot <- ggraph(subgraph_g, layout = layout) + 
+    geom_edge_link(aes(color = E(subgraph_g)$color,start_cap = label_rect(node1.name),
+                       end_cap = label_rect(node2.name)), 
+                   arrow = arrow(type = "closed", length = unit(4, "mm"))) +
+    geom_node_label(aes(label = name, col = text_color), repel = FALSE, alpha = 0.6,size = 5) +
+    #scale_fill_manual(values = c("PD_late" = "palegreen3","PD_mid" = "lightsalmon4","PD_early" = "slateblue","None" = "grey50"),name = "Gene Source") + 
+    scale_color_manual(values = c("PD_late" = "gold", "PD_mid" = "violet", "PD_early" = "gold", "None" = "black"), 
+                       name = "PIDC core") +
+    #scale_size_manual(values = c())+
+    scale_edge_color_manual(values = c("Stimulation" = "red", "Inhibition" = "blue", "Unknown" = "black"),
+                            name = "Interaction Type") +
+    theme_graph() + 
+    ggtitle(plotTitle) +
+    theme(text = element_text(family = "Times", size = 15), 
+          plot.title = element_text(family = "Times", size = 20)) 
+  return(list(graph = subgraph_g, plot = plot))
+}
+database_Network_ora_PIDC <- function(database, geneSet, geneSet_name, n_hits,
+                                      master_df,layout, plotTitle = "NoTitle", showZero = FALSE){
+  
+  genes <- intersect(c(geneSet), unique(c(database$source_genesymbol, database$target_genesymbol)))
+  OPI_g <- interaction_graph(interactions = database)
+  all_edges <- c()
+  for (i in 1:(length(genes)-1)) {
+    for (j in (i+1):length(genes)) {
+      sp <- shortest_paths(OPI_g, from = genes[i], to = genes[j], output = "epath")
+      sp2 <- shortest_paths(OPI_g, from = genes[j], to = genes[i], output = "epath")
+      if (!is.null(sp$epath[[1]]) && length(sp$epath[[1]]) %in% c(1,2)) {
+        path_edges <- sp$epath[[1]]
+        all_edges <- c(all_edges, path_edges)
+      }else if (!is.null(sp2$epath[[1]]) && length(sp2$epath[[1]]) %in% c(1,2)){
+        path_edges <- sp2$epath[[1]]
+        all_edges <- c(all_edges, path_edges)
+      }
+    }
+  }
+  all_edges <- unique(all_edges)
+  subgraph_g <- subgraph.edges(OPI_g, eids = all_edges, delete.vertices = TRUE)
+  subgraph_g <- as.directed(subgraph_g, mode = "mutual")
+  
+  if (showZero == TRUE){
+    isolated_genes <- setdiff(genes, V(subgraph_g)$name)
+    # Add isolated genes as vertices to 'subgraph_g'
+    for (gene in isolated_genes) {
+      subgraph_g <- add_vertices(subgraph_g, 1, name = gene)
+    }
+  }
+  # Prepare a named vector of colors based on the desiredComp values
+  ora_df_target <- master_df[which(master_df$geneSetName == geneSet_name & master_df$Direction == "Target"),]
+  ora_df_source <- master_df[which(master_df$geneSetName == geneSet_name & master_df$Direction == "Source"),]
+  top_target <- ora_df_target %>%
+    arrange(pAdj) %>%
+    slice_head(n = n_hits) %>%
+    filter(count > 2)%>%
+    pull(gene)
+  top_source <- ora_df_source %>%
+    arrange(pAdj) %>%
+    slice_head(n = n_hits)%>%
+    filter(count > 2)%>%
+    pull(gene)
+  
+  PIDC_ON_df <- as.data.frame(list(gene = V(PIDC_list$ON24BGN_PD_signature_adjMatrix)$name, 
+                                   centrality = V(PIDC_list$ON24BGN_PD_signature_adjMatrix)$centrality))
+  PIDC_lateON_df <- as.data.frame(list(gene=V(PIDC_list$lateON24BGN_PD_signature_adjMatrix)$name,
+                                       centrality = V(PIDC_list$lateON24BGN_PD_signature_adjMatrix)$centrality))
+  PIDC_merged <- merge(PIDC_ON_df, PIDC_lateON_df, by = "gene")
+  PIDC_merged$centrality <- rowMeans(PIDC_merged[,c(2,3)])
+  PIDC_merged$rankCentrality <- rank(PIDC_merged$centrality)
+  ranks_vector <- setNames(PIDC_merged$centrality, PIDC_merged$gene)
+  
+  V(subgraph_g)$centrality <- sapply(V(subgraph_g)$name, function(name) {
+    if(name %in% names(ranks_vector)) {
+      return(ranks_vector[name])
+    } else {
+      return(max(PIDC_merged$rankCentrality) + 1)
+    }
+  })
+  
+  
+  #V(subgraph_g)$color <- sapply(V(subgraph_g)$name, get_vertex_color, signatures_list$PD_late, signatures_list$PD_mid, signatures_list$PD_early)
+  V(subgraph_g)$color <- ifelse(V(subgraph_g)$name %in% top_target & V(subgraph_g)$name %in% top_source, "Both",
+                                ifelse(V(subgraph_g)$name %in% top_target, "Downstream",
+                                       ifelse(V(subgraph_g)$name %in% top_source, "Upstream", "No Info"))
+  )
+  #V(subgraph_g)$text_color <- sapply(V(subgraph_g)$name, get_vertex_color, PIDCgraph_list$PD_late_intersect, PIDCgraph_list$PD_mid_intersect, PIDCgraph_list$PD_early)
+  V(subgraph_g)$text_color <- ifelse(V(subgraph_g)$name %in% genes, "PIDC", "None")
+  #V(subgraph_g)$centrality <- sapply(V(subgraph_g)$name, function(vertex_name) assign_centrality(subgraph_g, vertex_name))
+  
+  E(subgraph_g)$color <- ifelse(E(subgraph_g)$consensus_stimulation == 1, "Stimulation", 
+                                ifelse(E(subgraph_g)$consensus_inhibition == 1, "Inhibition", "Unknown"))
+  
+  plot <- ggraph(subgraph_g, layout = layout) + 
+    geom_edge_link(aes(color = E(subgraph_g)$color,start_cap = label_rect(node1.name),
+                       end_cap = label_rect(node2.name)), 
+                   arrow = arrow(type = "closed", length = unit(4, "mm"))) +
+    geom_node_label(aes(label = name, fill = V(subgraph_g)$color, col = text_color), 
+                    size = (8 / (min(V(subgraph_g)$centrality) - max(V(subgraph_g)$centrality))) * V(subgraph_g)$centrality + 
+                      (10 - (8 / (min(V(subgraph_g)$centrality) - max(V(subgraph_g)$centrality))) * min(V(subgraph_g)$centrality)),
+                    repel = FALSE, alpha = 0.6,size = 5) +
+    #scale_fill_manual(values = c("PD_late" = "palegreen3","PD_mid" = "lightsalmon4","PD_early" = "slateblue","None" = "grey50"),name = "Gene Source") + 
+    scale_fill_manual(values = c("Downstream" = "blue", "Upstream" = "red", "Both" = "darkorchid1","No Info" = "grey50"), name = "Regulators") +
+    scale_color_manual(values = c("PIDC"= "gold", "None" = "black"), 
+                       name = "PIDC core") +
+    #scale_size_manual(values = c())+
+    scale_edge_color_manual(values = c("Stimulation" = "red", "Inhibition" = "blue", "Unknown" = "black"),
+                            name = "Interaction Type") +
+    theme_graph() + 
+    ggtitle(plotTitle) +
+    theme(text = element_text(family = "Times", size = 15), 
+          plot.title = element_text(family = "Times", size = 20)) 
+  
+  return(list(graph = subgraph_g, plot = plot))
+}
+# Graphs from PIDC all ----
+## running the non-splitable conditions
+mouse = 10090
+allNetwork <- import_all_interactions(organism = mouse)
+allNetwork_RNA <- dplyr::filter(allNetwork, type == "transcriptional")
+indir <- "directory with all adjmatrix from PIDC"
+conditions <- gsub("\\.csv$", "", list.files(path = indir, pattern = "*.csv", full.names = FALSE)) # if just doing it for all files
+graph_list <- list()
+for (err_cond in conditions){
+  adj_matrix <- read.csv(paste0(indir,err_cond,".csv"), header = TRUE)
+  if(!all(adj_matrix == "false")){
+    rownames(adj_matrix) <- colnames(adj_matrix)
+    adj_matrix[adj_matrix == "true"] <- 1
+    adj_matrix[adj_matrix == "false"] <- 0
+    rownames(adj_matrix) <- colnames(adj_matrix)
+    g_topic <- graph_from_adjacency_matrix(as.matrix(adj_matrix), mode = "directed", diag = FALSE)
+    V(g_topic)$type <- ifelse(V(g_topic)$name %in% c(allNetwork_RNA$source_genesymbol, "S1S2"), "TF", "gene")
+    
+    g_topic <- delete.vertices(g_topic, which(igraph::degree(g_topic)==0))
+    centrality_df <- data.frame(
+      gene = V(g_topic)$name,
+      degree = igraph::degree(g_topic),
+      eigen = evcent(g_topic)$vector,
+      betweenness = betweenness(g_topic, directed = FALSE)
+    )
+    centrality_df$degree_rank <- rank(-centrality_df$degree, ties.method = "min")
+    centrality_df$eigen_rank <- rank(-centrality_df$eigen, ties.method = "min")
+    centrality_df$betweenness_rank <- rank(-centrality_df$betweenness, ties.method = "min")
+    centrality_df$centrality <- rowMeans(centrality_df[,c("degree_rank", "eigen_rank", "betweenness_rank")])
+    
+    V(g_topic)$centrality <- centrality_df$centrality
+    
+    print(ggraph(g_topic) + 
+            geom_edge_link() + 
+            geom_node_point(aes(shape = type), size = 6) +  # Differentiating by shape
+            geom_node_label(aes(label = name,size = -log10(centrality), fill = -log10(centrality)), repel = FALSE, alpha = 0.7) +  # Adding node labels
+            theme_graph() + ggtitle(err_cond)+
+            labs(shape = "Type", size = "Centrality", fill = "Centrality")+
+            theme(text = element_text(family = "Times", size = 15), 
+                  plot.title = element_text(family = "Times", size = 20)))  # Updating legend title for shape
+    print(ggraph(g_topic) + 
+            geom_edge_link() + 
+            geom_node_point(aes(shape = type), size = 6) +  # Differentiating by shape
+            geom_node_label(aes(label = name), repel = FALSE, alpha = 0.7) +  # Adding node labels
+            theme_graph() + ggtitle(err_cond)+
+            labs(shape = "Type",  fill = "Centrality")+
+            theme(text = element_text(family = "Times", size = 15), 
+                  plot.title = element_text(family = "Times", size = 20)))  # Updating legend title for shape
+    
+    graph_list[[err_cond]] <- g_topic
+  }
+}
+qsave(graph_list, "PIDC_10perct.qs")
+
+# ORA network signature Networks ----
+master_df <- data.frame(geneSetName = character(), 
+                        Omics = character(), 
+                        Direction = character(), 
+                        stringsAsFactors = FALSE)
+PIDCgraph_list <- list("with the gene sets from which you want to make overenrichment later on. Like PD signature, PD early...")
+string_db <- STRINGdb$new(species=mouse,score_threshold=600, network_type="full", input_directory="")
+
+for (i in seq_along(PIDCgraph_list)){
+  geneSet <- PIDCgraph_list[[i]]
+  geneVecName <- names(PIDCgraph_list)[i]
+  print(geneVecName)
+  STRING_rows_df <- get_STRING_dataframe(string_db = string_db, geneSet = geneSet)
+  STRING_rows_df_filtered <- anti_join(STRING_rows_df, combinedProteinRNA_df, 
+                                       by = c("source_genesymbol" = "source_genesymbol", 
+                                              "target_genesymbol" = "target_genesymbol"))
+  
+  database <- rbind(combinedProteinRNA_df, STRING_rows_df_filtered)
+  database$consensus_stimulation[is.na(database$consensus_stimulation)] <- 0
+  database$consensus_inhibition[is.na(database$consensus_inhibition)] <- 0
+  
+  ora_target_df <- database %>%
+    group_by(target_genesymbol) %>%
+    summarise(
+      source_genesymbols = list(unique(source_genesymbol)),
+      length_of_list = length(unique(source_genesymbol)),
+      .groups = 'drop'
+    )
+  ora_source_df <- database %>%
+    group_by(source_genesymbol) %>%
+    summarise(
+      target_genesymbols = list(unique(target_genesymbol)),
+      length_of_list = length(unique(target_genesymbol)),
+      .groups = 'drop'
+    )
+  merged_df <- merge(ora_target_df, ora_source_df, by.x = "target_genesymbol", by.y = "source_genesymbol", 
+                     all = TRUE)
+  merged_df$combined_lists <- mapply(
+    function(x, y) {
+      # If x is NA, return y (unless y is also NA, handled above)
+      if (all(is.na(x))) {
+        return(y)
+      }
+      # If y is NA, return x
+      if (all(is.na(y))) {
+        return(x)
+      }
+      # If neither is NA, combine them
+      return(c(x, y))
+    },
+    merged_df$source_genesymbols, merged_df$target_genesymbols,
+    SIMPLIFY = FALSE  # Keep the output as a list
+  )
+  merged_df$combined_length <- sapply(merged_df$combined_lists, length)
+  ora_both_df <- merged_df[, c("target_genesymbol", "combined_lists", "combined_length")]
+  colnames(ora_both_df) <- c("gene", "combined_lists", "combined_length")
+  
+  ## protein
+  db <- database
+  ## source
+  ora_df <- ora_source_df
+  protein_source_result <- oraNetwork(c(geneSet), db, ora_df = ora_source_df, type = "Source")
+  if (nrow(protein_source_result) > 0){
+    protein_source_result <- data.frame(protein_source_result, 
+                                        geneSetName = geneVecName, 
+                                        Omics = "Protein", 
+                                        Direction = "Source", 
+                                        stringsAsFactors = FALSE)
+    master_df <- rbind(master_df, protein_source_result)
+  }
+  ##target
+  ora_df <- ora_target_df
+  protein_target_result <- oraNetwork(c(geneSet), db, ora_df = ora_target_df, type = "Target")
+  if (nrow(protein_target_result) > 0){
+    protein_target_result <- data.frame(protein_target_result, 
+                                        geneSetName = geneVecName, 
+                                        Omics = "Protein", 
+                                        Direction = "Target", 
+                                        stringsAsFactors = FALSE)
+    master_df <- rbind(master_df, protein_target_result)
+  }
+  ##both
+  ora_df <- ora_both_df
+  protein_both_result <- oraNetwork(c(geneSet), db, ora_df = ora_df, type = "Both")
+  if (nrow(protein_both_result) > 0){
+    protein_both_result <- data.frame(protein_both_result, 
+                                      geneSetName = geneVecName, 
+                                      Omics = "Protein", 
+                                      Direction = "Both", 
+                                      stringsAsFactors = FALSE)
+    master_df <- rbind(master_df, protein_both_result)
+  }
+}
+
+qsave(master_df,"ORA_PDsign_network_masterdf.qs")
+
+# PIDC and omnipath and STRING----
+mouse = 10090
+string_db <- STRINGdb$new(species=mouse,score_threshold=600, network_type="full", input_directory="")
+combinedProteinRNA_df <- "get all interactions from omnipathR"
+PIDC_list <- qread("PIDC_10perct.qs")
+comparisons <- sub("^[^_]*_(.*)$", "\\1", names(PIDC_list))
+comparisons_unique <- unique(comparisons)
+# Split the list based on comparisons
+split_list <- split(PIDC_list, comparisons_unique)
+master_df <- qread("ORA_PDsign_network_masterdf.qs")
+PIDCgraph_list <- list("all gene sets you wanna build graphs to. See below for example")
+
+
+## as for loop
+geneSet_list <- list(PD_core_late = PIDCgraph_list$PD_core_late,
+                     PD_core_early = PIDCgraph_list$PD_core_early,
+                     pre_PD_intPD = PIDCgraph_list$pre_PD_intPD,
+                     pre_PD = PIDCgraph_list$pre_PD,
+                     ageSign = PIDCgraph_list$ageSign,
+                     agePD = PIDCgraph_list$agePD)
+
+networkGraph_list <- list()
+networkPlot_list <- list()
+for (geneSet_name in names(geneSet_list)){
+  print(paste0("Processing: ", geneSet_name))
+  geneSet <- geneSet_list[[geneSet_name]]
+  n_hits <- ifelse(geneSet_name == "PD_early", 2, 15)
+  
+  STRING_rows_df <- get_STRING_dataframe(string_db = string_db, geneSet = geneSet)
+  
+  STRING_rows_df_filtered <- anti_join(STRING_rows_df, combinedProteinRNA_df, 
+                                       by = c("source_genesymbol" = "source_genesymbol", 
+                                              "target_genesymbol" = "target_genesymbol"))
+  
+  database <- rbind(combinedProteinRNA_df, STRING_rows_df_filtered)
+  database$consensus_stimulation[is.na(database$consensus_stimulation)] <- 0
+  database$consensus_inhibition[is.na(database$consensus_inhibition)] <- 0
+  
+  print(paste0("Making igraph Graph and Plot..."))
+  graph_plot_list <- database_Network_ora(database = database, geneSet = geneSet, 
+                                          geneSet_name = geneSet_name, n_hits = n_hits, 
+                                          master_df = master_df, layout = "stress",
+                                          plotTitle = geneSet_name, showZero = FALSE)
+  networkGraph_list[[geneSet_name]] <- graph_plot_list[["graph"]]
+  networkPlot_list[[geneSet_name]] <- list(direction = graph_plot_list[["plot_direction"]], regulator = graph_plot_list[["plot_reg"]])
+}
+qsave(networkGraph_list, "stringOmnipath_Network_Graphs.qs")
+qsave(networkPlot_list, "stringOmnipath_Network_Plots.qs")
+
+## ranking genes according to over enrichment
+networkPlot_list$ageSign$regulator ## as example with ageSign
+networkPlot_list$ageSign$direction ## as example with ageSign
+subgraph_g <- networkGraph_list$PD_core_late
+table(V(subgraph_g)$color)
+geneSet_name <- "PD_core_late"
+ora_df_target <- master_df[which(master_df$geneSetName == geneSet_name & master_df$Direction == "Target"),]
+ora_df_source <- master_df[which(master_df$geneSetName == geneSet_name & master_df$Direction == "Source"),]
+ora_df_both <- master_df[which(master_df$geneSetName == geneSet_name & master_df$Direction == "Both"),]
+PIDC_PD_df <- as.data.frame(list(gene = V(subgraph_g)$name))
+
+geneInfo <- merge(PIDC_PD_df, ora_df_target[, c("gene", "pAdj")], by = "gene")
+geneInfo <- merge(geneInfo, ora_df_source[, c("gene", "pAdj")], by = "gene")
+geneInfo <- merge(geneInfo, ora_df_both[, c("gene", "pAdj")], by = "gene")
+colnames(geneInfo) <- c("gene", "pAdj_target", "pAdj_source", "pAdj_both")
+geneInfo$sigTarget <- "nonSig"
+geneInfo$sigTarget[which(geneInfo$gene %in% V(subgraph_g)$name[which(V(subgraph_g)$color %in% c("Downstream", "Both"))])] <- "sig"
+geneInfo$sigSource <- "nonSig"
+geneInfo$sigSource[which(geneInfo$gene %in% V(subgraph_g)$name[which(V(subgraph_g)$color %in% c("Upstream", "Both"))])] <- "sig"
+geneInfo$sigBoth <- "nonSig"
+geneInfo$sigBoth[which(geneInfo$gene %in% V(subgraph_g)$name[which(V(subgraph_g)$regulator %in% c("Regulator"))])] <- "sig"
+
+rownames(geneInfo) <- geneInfo$gene
+
+geneInfo$gene <- fct_reorder(geneInfo$gene, -log10(geneInfo$pAdj_both))
+
+ggplot(geneInfo[which(geneInfo$pAdj_both < 0.05),], aes(x= -log10(pAdj_both), y = gene, col = sigBoth, fill = sigBoth)) +
+  geom_col() +
+  theme_minimal() +
+  labs(title = "Regulators",
+       x = "-log10(pAdj)",
+       y = "") +
+  theme(axis.text.y = element_text(size = 12),
+        axis.text.x = element_text(size = 10, angle = 45, hjust = 1),
+        axis.title.x = element_text(size = 12),
+        axis.title.y = element_blank(), # Since y-axis labels are just descriptions
+        legend.position = "right")
+
+geneInfo$gene <- fct_reorder(geneInfo$gene, -log10(geneInfo$pAdj_target))
+ggplot(geneInfo[which(geneInfo$pAdj_target < 0.05),], aes(x= -log10(pAdj_target), y = gene, col = sigTarget, fill = sigTarget)) +
+  geom_col() +
+  theme_minimal() +
+  labs(title = "Target",
+       x = "-log10(pAdj)",
+       y = "") +
+  theme(axis.text.y = element_text(size = 12),
+        axis.text.x = element_text(size = 10, angle = 45, hjust = 1),
+        axis.title.x = element_text(size = 12),
+        axis.title.y = element_blank(), # Since y-axis labels are just descriptions
+        legend.position = "right")
+
+
+geneInfo$gene <- fct_reorder(geneInfo$gene, -log10(geneInfo$pAdj_source))
+ggplot(geneInfo[which(geneInfo$pAdj_source < 0.05),], aes(x= -log10(pAdj_source), y = gene,col = sigSource, fill = sigSource)) +
+  geom_col() +
+  theme_minimal() +
+  labs(title = "Source",
+       x = "-log10(pAdj)",
+       y = "") +
+  theme(axis.text.y = element_text(size = 12),
+        axis.text.x = element_text(size = 10, angle = 45, hjust = 1),
+        axis.title.x = element_text(size = 12),
+        axis.title.y = element_blank(), # Since y-axis labels are just descriptions
+        legend.position = "right")
+
+## ageing from PD: Pathological Aging ----
+networkPlot_list$agePD
+agePDGraph <- networkGraph_list$agePD
+ageGraph <- networkGraph_list$ageSign
+PDcoreGraph <- networkGraph_list$PD_core_late
+agePD <- intersect(V(PDcore)$name[which(V(PDcore)$regulator =="Regulator")], PDsignature_geneSet_list$ageingSign)
+
+upstreamGenes_age <- V(agePDGraph)$name[V(agePDGraph)$color == "Upstream"]
+downstreamGenes_age <- V(agePDGraph)$name[V(agePDGraph)$color == "Downstream"]
+AgebothGenes <- V(agePDGraph)$name[V(agePDGraph)$color == "Both"]
+agePDcentral <- V(agePDGraph)$name[V(agePDGraph)$regulator == "Regulator"]
+
+intersect(agePD, agePDcentral)
+
+subgraph_g <- agePDGraph
+table(V(subgraph_g)$color)
+geneSet_name <- "agePD"
+ora_df_target <- master_df[which(master_df$geneSetName == geneSet_name & master_df$Direction == "Target"),]
+ora_df_source <- master_df[which(master_df$geneSetName == geneSet_name & master_df$Direction == "Source"),]
+ora_df_both <- master_df[which(master_df$geneSetName == geneSet_name & master_df$Direction == "Both"),]
+
+PIDC_PD_df <- as.data.frame(list(gene = V(subgraph_g)$name))
+
+geneInfo <- merge(PIDC_PD_df, ora_df_target[, c("gene", "pAdj")], by = "gene")
+geneInfo <- merge(geneInfo, ora_df_source[, c("gene", "pAdj")], by = "gene")
+geneInfo <- merge(geneInfo, ora_df_both[, c("gene", "pAdj")], by = "gene")
+colnames(geneInfo) <- c("gene", "pAdj_target", "pAdj_source", "pAdj_both")
+geneInfo$sigTarget <- "nonSig"
+geneInfo$sigTarget[which(geneInfo$gene %in% V(subgraph_g)$name[which(V(subgraph_g)$color %in% c("Downstream", "Both"))])] <- "sig"
+geneInfo$sigSource <- "nonSig"
+geneInfo$sigSource[which(geneInfo$gene %in% V(subgraph_g)$name[which(V(subgraph_g)$color %in% c("Upstream", "Both"))])] <- "sig"
+geneInfo$sigBoth <- "nonSig"
+geneInfo$sigBoth[which(geneInfo$gene %in% V(subgraph_g)$name[which(V(subgraph_g)$regulator %in% c("Regulator"))])] <- "sig"
+
+
+rownames(geneInfo) <- geneInfo$gene
+
+geneInfo$gene <- fct_reorder(geneInfo$gene, -log10(geneInfo$pAdj_both))
+ggplot(geneInfo[which(geneInfo$pAdj_both < 0.05),], aes(x= -log10(pAdj_both), y = gene, col = sigBoth, fill = sigBoth)) +
+  geom_col() +
+  theme_minimal() +
+  labs(title = "Regulator",
+       x = "-log10(pAdj)",
+       y = "") +
+  theme(axis.text.y = element_text(size = 12),
+        axis.text.x = element_text(size = 10, angle = 45, hjust = 1),
+        axis.title.x = element_text(size = 12),
+        axis.title.y = element_blank(), # Since y-axis labels are just descriptions
+        legend.position = "right")
+
+geneInfo$gene <- fct_reorder(geneInfo$gene, -log10(geneInfo$pAdj_target))
+ggplot(geneInfo[which(geneInfo$pAdj_target < 0.05),], aes(x= -log10(pAdj_target), y = gene, col = sigTarget, fill = sigTarget)) +
+  geom_col() +
+  theme_minimal() +
+  labs(title = "Target",
+       x = "-log10(pAdj)",
+       y = "") +
+  theme(axis.text.y = element_text(size = 12),
+        axis.text.x = element_text(size = 10, angle = 45, hjust = 1),
+        axis.title.x = element_text(size = 12),
+        axis.title.y = element_blank(), # Since y-axis labels are just descriptions
+        legend.position = "right")
+
+
+geneInfo$gene <- fct_reorder(geneInfo$gene, -log10(geneInfo$pAdj_source))
+ggplot(geneInfo[which(geneInfo$pAdj_source < 0.05),], aes(x= -log10(pAdj_source), y = gene,col = sigSource, fill = sigSource)) +
+  geom_col() +
+  theme_minimal() +
+  labs(title = "Source",
+       x = "-log10(pAdj)",
+       y = "") +
+  theme(axis.text.y = element_text(size = 12),
+        axis.text.x = element_text(size = 10, angle = 45, hjust = 1),
+        axis.title.x = element_text(size = 12),
+        axis.title.y = element_blank(), # Since y-axis labels are just descriptions
+        legend.position = "right")
+
+{
+  layout <- layout <- create_layout(subgraph_g, layout = 'with_kk')
+  
+  plot <- ggraph(layout) + 
+    geom_edge_link(aes(color = E(subgraph_g)$color,start_cap = label_rect(node1.name),
+                       end_cap = label_rect(node2.name)), 
+                   arrow = arrow(type = "closed", length = unit(4, "mm"))) +
+    geom_node_label(aes(label = name, fill = V(subgraph_g)$regulator, col = text_color),
+                    repel = FALSE, alpha = 0.8,size = 5) +
+    scale_fill_manual(values = c("Regulator" = "red","No Info" = "grey50"), name = "Regulators") +
+    scale_color_manual(values = c("PIDC"= "gold", "None" = "black"), 
+                       name = "PIDC core") +
+    scale_edge_color_manual(values = c("Stimulation" = "red", "Inhibition" = "blue", "Unknown" = "black"),
+                            name = "Interaction Type") +
+    theme_graph() + 
+    ggtitle("Pathological Ageing") +
+    theme(text = element_text(family = "Times", size = 15), 
+          plot.title = element_text(family = "Times", size = 20)) 
+  plot  
+  }
+
+noInfoVertices <- V(subgraph_g)$name[V(subgraph_g)$regulator == "No Info"]
+agePDgraph_simple <- subgraph_g
+for(vertex in noInfoVertices) {
+  # Find neighbors of the "No Info" vertex
+  neighbor_ids_in <- neighbors(subgraph_g, vertex, mode = "in")
+  neighbor_ids_out <- neighbors(subgraph_g, vertex, mode = "out")
+  print(paste0("Vertex: ", vertex))
+  # Create edges between all pairs of neighbors
+  if(length(neighbor_ids_in) > 1 & length(neighbor_ids_out) > 1){
+    for(i in 1:(length(neighbor_ids_in))) {
+      for(j in 1:length(neighbor_ids_out)) {
+        # Check if an edge already exists between these two vertices
+        from_vertex_name <- V(subgraph_g)$name[neighbor_ids_in[i]]
+        to_vertex_name <- V(subgraph_g)$name[neighbor_ids_out[j]]
+        print(paste0("Length of present edge ", from_vertex_name, "->", to_vertex_name,": ", get.edge.ids(agePDgraph_simple, c(from_vertex_name, to_vertex_name), directed = TRUE)))
+        if(get.edge.ids(agePDgraph_simple, c(from_vertex_name, to_vertex_name), directed = TRUE) == 0){
+          print("Edge added!")
+          # Add an edge if it doesn't exist. Using vertex names for clarity.
+          agePDgraph_simple <- add_edges(agePDgraph_simple, c(from_vertex_name, to_vertex_name))
+        }
+      }
+    }
+  }
+}
+
+#remove
+agePDgraph_simple <- delete_vertices(agePDgraph_simple, noInfoVertices)
+vertices_to_remove <- V(agePDgraph_simple)[igraph::degree(agePDgraph_simple) == 0]
+agePDgraph_simple <- delete_vertices(agePDgraph_simple, vertices_to_remove)
+edges_to_remove <- E(agePDgraph_simple)[from(V(agePDgraph_simple)[name %in% agePD])]
+agePDgraph_simple <- delete_edges(agePDgraph_simple, edges_to_remove)
+
+{
+  layout <- layout <- create_layout(agePDgraph_simple, layout = 'tree')
+  
+  agePD_indices <- which(layout$name %in% agePD)
+  
+  # xOffset: the amount to move horizontally
+  layout$y[agePD_indices] <- layout$y[agePD_indices] - 10
+  
+  plot <- ggraph(layout) + 
+    geom_edge_link(aes(color = E(agePDgraph_simple)$color,start_cap = label_rect(node1.name),
+                       end_cap = label_rect(node2.name)), alpha = 0.5, 
+                   arrow = arrow(type = "closed", length = unit(4, "mm"))) +
+    geom_node_label(aes(label = name, fill = V(agePDgraph_simple)$regulator, col = text_color),
+                    repel = FALSE, alpha = 0.8,size = 5) +
+    scale_fill_manual(values = c("Regulator" = "red","No Info" = "grey50"), name = "Regulators") +
+    scale_color_manual(values = c("PIDC"= "gold", "None" = "black"), 
+                       name = "PIDC core") +
+    scale_edge_color_manual(values = c("Stimulation" = "red", "Inhibition" = "blue", "Unknown" = "black"),
+                            name = "Interaction Type") +
+    theme_graph() + 
+    ggtitle("Pathological Ageing") +
+    theme(text = element_text(family = "Times", size = 15), 
+          plot.title = element_text(family = "Times", size = 20)) 
+  plot  
+}
+
+
+## PD late core with MS ----
+PDlate_MS <- c("Alg2", "Atp1a1", "Atp1a2", "Atp1a3", "Atp1b1", "Atp2a2", "Cdkn1b", "Faah", 
+               "Flii", "Ina", "Lrrc47", "Myh10", "Myh9", "Myo18a", "Nebl", "Nefh", "Nefl", "Npm1", 
+               "Nptn", "Prkar2a", "Rpl34", "Snrpd1", "Thy1", "Tpd52")
+PDlate <- V(networkGraph_list$PD_core_late)$name
+#prePD <- unique(c(PDsignature_geneSet_list$pre_PD_late, PDsignature_geneSet_list$pre_PD_early))
+STRING_rows_df <- get_STRING_dataframe(string_db = string_db, geneSet = unique(c(PDlate_MS, PIDCgraph_list$PD_core_late)))
+
+STRING_rows_df_filtered <- anti_join(STRING_rows_df, combinedProteinRNA_df, 
+                                     by = c("source_genesymbol" = "source_genesymbol", 
+                                            "target_genesymbol" = "target_genesymbol"))
+
+database <- rbind(combinedProteinRNA_df, STRING_rows_df_filtered)
+database$consensus_stimulation[is.na(database$consensus_stimulation)] <- 0
+database$consensus_inhibition[is.na(database$consensus_inhibition)] <- 0
+
+PDlate_MS <- intersect(c(PDlate_MS), unique(c(database$source_genesymbol, database$target_genesymbol)))
+#prePD <- intersect(c(prePD), unique(c(database$source_genesymbol, database$target_genesymbol)))
+OPI_g <- interaction_graph(interactions = database)
+edges_of_interest <- c()
+# Loop through each gene in OPI_g
+for(start_gene in PDlate_MS) {
+  for(end_gene in unique(c(PDlate))) {
+    # Paths from start_gene to end_gene
+    paths <- all_simple_paths(OPI_g, from = start_gene, to = end_gene, cutoff = 1)
+    # Paths from end_gene to start_gene
+    paths2 <- all_simple_paths(OPI_g, from = end_gene, to = start_gene, cutoff = 1)
+    
+    # Combine paths from both directions
+    all_paths <- c(paths, paths2)
+    
+    # If paths exist, extract the edge ids from those paths
+    for(path in all_paths) {
+      if(length(path) > 1) { # Ensuring the path contains more than one vertex
+        for(i in seq_along(path)[-length(path)]) {
+          edge_id <- get.edge.ids(OPI_g, c(path[i], path[i+1]))
+          edges_of_interest <- c(edges_of_interest, edge_id)
+        }
+      }
+    }
+  }
+}
+all_edges <- unique(edges_of_interest)
+PDcoreMSgraph <- subgraph.edges(OPI_g, eids = all_edges, delete.vertices = TRUE)
+PDcoreMSgraph <- as.directed(PDcoreMSgraph, mode = "mutual")
+E(PDcoreMSgraph)$source <- "MassSpec"
+
+ggraph(PDcoreMSgraph, layout = "with_kk") + 
+  geom_edge_link(aes(start_cap = label_rect(node1.name),
+                     end_cap = label_rect(node2.name)), 
+                 arrow = arrow(type = "closed", length = unit(4, "mm"))) +
+  geom_node_label(aes(label = name, ),
+                  repel = FALSE, alpha = 0.8,size = 5)
+## ageing from MS and ageSign ----
+ageSign <- c("Tubb2a", "Dynll1", "Tubb5", "Actb", "Cd63", "Actg1", "Tuba4a", "Tuba1a", "Erbb4", "Cfl1", "Fgf13",
+             "Cadm1", "Tanc1", "Vamp2", "Ubc","Hspa8", "Ubb", "Oaz1", "Calm3", "Ran", "Dusp1", "Tpt1", "Eif1",
+             "Rps28", "Acp1", "Ppia")
+msAge <- c("Anxa3", "Akr1b7", "Slc27a4", "Dhdh","Pfdn5","Myh10", "Lrrc47")
+
+STRING_rows_df <- get_STRING_dataframe(string_db = string_db, geneSet = unique(c(mitochondrialAge, ageSign, msAge)))
+
+STRING_rows_df_filtered <- anti_join(STRING_rows_df, combinedProteinRNA_df, 
+                                     by = c("source_genesymbol" = "source_genesymbol", 
+                                            "target_genesymbol" = "target_genesymbol"))
+
+database <- rbind(combinedProteinRNA_df, STRING_rows_df_filtered)
+database$consensus_stimulation[is.na(database$consensus_stimulation)] <- 0
+database$consensus_inhibition[is.na(database$consensus_inhibition)] <- 0
+
+
+genes <- intersect(unique(c(mitochondrialAge, ageSign, msAge)), unique(c(database$source_genesymbol, database$target_genesymbol)))
+g <- interaction_graph(interactions = database)
+all_edges <- c()
+for (gene in genes) {
+  print(gene)
+  # Find the neighborhood of the current gene within distance 2
+  neighborhood_genes <- unlist(neighborhood(graph = g, order = 2, nodes = gene, mode = "out"))
+  neighborhood_gene_names <- V(g)[neighborhood_genes]$name
+  filtered_neighborhood_genes <- neighborhood_gene_names[neighborhood_gene_names %in% genes]
+  for (neighbor_gene in filtered_neighborhood_genes) {
+    if (neighbor_gene != gene) { # Ensure we don't calculate a path to itself
+      sp <- shortest_paths(g, from = gene, to = neighbor_gene, mode = "out", algorithm = "unweighted", output = "both")
+      
+      # If path length is up to 2, prepare the edges for this path
+      if (!is.null(sp$vpath[[1]]) && length(sp$vpath[[1]]) <= 3) {
+        path_edges <- sp$epath[[1]]
+        all_edges <- c(all_edges, path_edges)
+      }
+    }
+  }
+}
+all_edges <- unique(all_edges)
+ageNetwork <- subgraph.edges(g, eids = all_edges, delete.vertices = TRUE)
+ageNetwork <- as.directed(ageNetwork, mode = "mutual")
+V(ageNetwork)$regulator <- ifelse(V(ageNetwork)$name %in% mitochondrialAge, "Age Mitochondria",
+                                  ifelse(V(ageNetwork)$name %in% ageSign, "Top 40 Central Regulators",
+                                         ifelse(V(ageNetwork)$name %in% msAge, "Age MS", "No Info")))
+
+ggraph(ageNetwork, layout = "stress") + 
+  geom_edge_link(aes(start_cap = label_rect(node1.name),
+                     end_cap = label_rect(node2.name)), 
+                 arrow = arrow(type = "closed", length = unit(4, "mm"))) +
+  geom_node_label(aes(label = name, fill = regulator ),
+                  repel = FALSE, alpha = 0.8,size = 5) +
+  scale_fill_manual(values = c("Age Mitochondria" = "bisque2", "Top 40 Central Regulators" = "red", "Age MS" = "greenyellow",
+                               "No Info" = "grey"))
+
+noInfoVertices <- V(ageNetwork)$name[V(ageNetwork)$regulator == "No Info"]
+ageNetwork_simple <- ageNetwork
+for(vertex in noInfoVertices) {
+  # Find neighbors of the "No Info" vertex
+  neighbor_ids_in <- neighbors(ageNetwork, vertex, mode = "in")
+  neighbor_ids_out <- neighbors(ageNetwork, vertex, mode = "out")
+  print(paste0("Vertex: ", vertex))
+  # Create edges between all pairs of neighbors
+  if(length(neighbor_ids_in) > 1 & length(neighbor_ids_out) > 1){
+    for(i in 1:(length(neighbor_ids_in))) {
+      for(j in 1:length(neighbor_ids_out)) {
+        # Check if an edge already exists between these two vertices
+        from_vertex_name <- V(ageNetwork)$name[neighbor_ids_in[i]]
+        to_vertex_name <- V(ageNetwork)$name[neighbor_ids_out[j]]
+        print(paste0("Length of present edge ", from_vertex_name, "->", to_vertex_name,": ", get.edge.ids(ageNetwork_simple, c(from_vertex_name, to_vertex_name), directed = TRUE)))
+        if(get.edge.ids(ageNetwork_simple, c(from_vertex_name, to_vertex_name), directed = TRUE) == 0){
+          print("Edge added!")
+          # Add an edge if it doesn't exist. Using vertex names for clarity.
+          ageNetwork_simple <- add_edges(ageNetwork_simple, c(from_vertex_name, to_vertex_name))
+        }
+      }
+    }
+  }
+}
+
+#remove
+ageNetwork_simple <- delete_vertices(ageNetwork_simple, noInfoVertices)
+vertices_to_remove <- V(ageNetwork_simple)[igraph::degree(ageNetwork_simple) == 0]
+ageNetwork_simple <- delete_vertices(ageNetwork_simple, vertices_to_remove)
+#ageNetwork_simple <- delete_edges(ageNetwork_simple, edges_to_remove)
+
+ggraph(ageNetwork_simple, layout = "stress") + 
+  geom_edge_link(aes(color = E(ageNetwork_simple)$color,start_cap = label_rect(node1.name),
+                     end_cap = label_rect(node2.name)), alpha = 0.5, 
+                 arrow = arrow(type = "closed", length = unit(4, "mm"))) +
+  geom_node_label(aes(label = name, fill = V(ageNetwork_simple)$regulator),
+                  repel = FALSE, alpha = 0.8,size = 5) +
+  scale_fill_manual(values = c("Age Mitochondria" = "bisque2", "Top 40 Central Regulators" = "red", "Age MS" = "greenyellow",
+                               "No Info" = "grey"), name = "Regulator") +
+  theme_graph() + 
+  ggtitle("Ageing Network") +
+  theme(text = element_text(family = "Times", size = 15), 
+        plot.title = element_text(family = "Times", size = 20)) 
+
+## prePD ----
+prePD <- unique(c(PDsignature_geneSet_list$pre_PD_late, PDsignature_geneSet_list$pre_PD_early))
+prePDGraph <- networkGraph_list$pre_PD_intPD
+PDregulator <- V(PDcoreGraph)$name[V(PDcoreGraph)$regulator == "Regulator"]
+
+STRING_rows_df <- get_STRING_dataframe(string_db = string_db, geneSet = unique(c(prePD, PDregulator, PDlate_MS)))
+
+STRING_rows_df_filtered <- anti_join(STRING_rows_df, combinedProteinRNA_df, 
+                                     by = c("source_genesymbol" = "source_genesymbol", 
+                                            "target_genesymbol" = "target_genesymbol"))
+
+database <- rbind(combinedProteinRNA_df, STRING_rows_df_filtered)
+database$consensus_stimulation[is.na(database$consensus_stimulation)] <- 0
+database$consensus_inhibition[is.na(database$consensus_inhibition)] <- 0
+
+prePD <- intersect(c(prePD), unique(c(database$source_genesymbol, database$target_genesymbol)))
+PDlate_MS <- intersect(c(PDlate_MS), unique(c(database$source_genesymbol, database$target_genesymbol)))
+OPI_g <- interaction_graph(interactions = database)
+edges_of_interest <- c()
+# Loop through each gene in OPI_g
+for(start_gene in prePD) {
+  for(end_gene in c(prePD, PDregulator, PDlate_MS)) {
+    paths <- all_simple_paths(OPI_g, from = start_gene, to = end_gene, cutoff = 2)
+    # If paths exist, extract the edges from those paths
+    if(length(paths) > 0) {
+      for(path in paths) {
+        edges_of_interest <- c(edges_of_interest, E(OPI_g, path = path))
+      }
+    }
+  }
+}
+all_edges <- unique(edges_of_interest)
+prePDintGraph <- subgraph.edges(OPI_g, eids = all_edges, delete.vertices = TRUE)
+prePDintGraph <- as.directed(prePDintGraph, mode = "mutual")
+V(prePDintGraph)$regulator <- ifelse(V(prePDintGraph)$name %in% prePD, "Regulator prePD",
+                                     ifelse(V(prePDintGraph)$name %in% PDregulator, "Regulator PDcore",
+                                            ifelse(V(prePDintGraph)$name %in% PDlate_MS, "Regulator PD-MS", "No Info")))
+
+ggraph(prePDintGraph, layout = "with_kk") + 
+  geom_edge_link(aes(start_cap = label_rect(node1.name),
+                     end_cap = label_rect(node2.name)), 
+                 arrow = arrow(type = "closed", length = unit(4, "mm"))) +
+  geom_node_label(aes(label = name, fill = regulator ),
+                  repel = FALSE, alpha = 0.8,size = 5) +
+  scale_fill_manual(values = c("Regulator prePD" = "lightblue", "Regulator PDcore" = "red", "Regulator PD-MS" = "green",
+                               "No Info" = "grey"))
+
+
+noInfoVertices <- V(prePDintGraph)$name[V(prePDintGraph)$regulator == "No Info"]
+prePDintGraph_simple <- prePDintGraph
+for(vertex in noInfoVertices) {
+  # Find neighbors of the "No Info" vertex
+  neighbor_ids_in <- neighbors(prePDintGraph, vertex, mode = "in")
+  neighbor_ids_out <- neighbors(prePDintGraph, vertex, mode = "out")
+  print(paste0("Vertex: ", vertex))
+  # Create edges between all pairs of neighbors
+  if(length(neighbor_ids_in) > 1 & length(neighbor_ids_out) > 1){
+    for(i in 1:(length(neighbor_ids_in))) {
+      for(j in 1:length(neighbor_ids_out)) {
+        # Check if an edge already exists between these two vertices
+        from_vertex_name <- V(prePDintGraph)$name[neighbor_ids_in[i]]
+        to_vertex_name <- V(prePDintGraph)$name[neighbor_ids_out[j]]
+        print(paste0("Length of present edge ", from_vertex_name, "->", to_vertex_name,": ", get.edge.ids(prePDintGraph_simple, c(from_vertex_name, to_vertex_name), directed = TRUE)))
+        if(get.edge.ids(prePDintGraph_simple, c(from_vertex_name, to_vertex_name), directed = TRUE) == 0){
+          print("Edge added!")
+          # Add an edge if it doesn't exist. Using vertex names for clarity.
+          prePDintGraph_simple <- add_edges(prePDintGraph_simple, c(from_vertex_name, to_vertex_name))
+        }
+      }
+    }
+  }
+}
+
+#remove
+prePDintGraph_simple <- delete_vertices(prePDintGraph_simple, noInfoVertices)
+vertices_to_remove <- V(prePDintGraph_simple)[igraph::degree(prePDintGraph_simple) == 0]
+prePDintGraph_simple <- delete_vertices(prePDintGraph_simple, vertices_to_remove)
+edges_to_remove <- E(prePDintGraph_simple)[from(V(prePDintGraph_simple)[name %in% agePD])]
+prePDintGraph_simple <- delete_edges(prePDintGraph_simple, edges_to_remove)
+
+{
+  layout <- layout <- create_layout(prePDintGraph_simple, layout = 'with_kk')
+  
+  plot <- ggraph(layout) + 
+    geom_edge_link(aes(color = E(prePDintGraph_simple)$color,start_cap = label_rect(node1.name),
+                       end_cap = label_rect(node2.name)), alpha = 0.5, 
+                   arrow = arrow(type = "closed", length = unit(4, "mm"))) +
+    geom_node_label(aes(label = name, fill = V(prePDintGraph_simple)$regulator),
+                    repel = FALSE, alpha = 0.8,size = 5) +
+    scale_fill_manual(values = c("Regulator" = "red","No Info" = "grey50"), name = "Regulators") +
+    scale_edge_color_manual(values = c("Stimulation" = "red", "Inhibition" = "blue", "Unknown" = "black"),
+                            name = "Interaction Type") +
+    theme_graph() + 
+    ggtitle("Pathological Ageing") +
+    theme(text = element_text(family = "Times", size = 15), 
+          plot.title = element_text(family = "Times", size = 20)) 
+  plot  
+}
+
+subGraphs_list <- list(PDcoreGraph = PDcoreGraph, agePDGraph = agePDgraph_simple,
+                       PDcoreMSgraph = PDcoreMSgraph, prePD = prePDintGraph_simple, ageAll_simple = ageNetwork_simple)
+## making union graph ----
+subGraphs_list 
+PDcoreGraph <- subGraphs_list$PDcoreGraph
+prePDintGraph <- subGraphs_list$prePD
+agePDGraph <- subGraphs_list$agePDGraph
+PDcoreMSgraph <- subGraphs_list$PDcoreMSgraph
+ageNetworkGraph <- subGraphs_list$ageAll_simple
+
+PDupstreamGenes <- V(PDcoreGraph)$name[V(PDcoreGraph)$color == "Upstream"]
+PDdownstreamGenes <- V(PDcoreGraph)$name[V(PDcoreGraph)$color == "Downstream"]
+PDbothGenes <- V(PDcoreGraph)$name[V(PDcoreGraph)$color == "Both"]
+PDregulator <- V(PDcoreGraph)$name[V(PDcoreGraph)$regulator == "Regulator"]
+PDlate_MS <- c("Alg2", "Atp1a1", "Atp1a2", "Atp1a3", "Atp1b1", "Atp2a2", "Cdkn1b", "Faah", 
+               "Flii", "Ina", "Lrrc47", "Myh10", "Myh9", "Myo18a", "Nebl", "Nefh", "Nefl", "Npm1", 
+               "Nptn", "Prkar2a", "Rpl34", "Snrpd1", "Thy1", "Tpd52")
+agePD_genes <- setdiff(V(agePDGraph)$name, agePD)
+prePD_genes <- c("Pde10a","Dgkb","Pde7b","Anks1b", "Adcy5","Sntg1")
+pathAge_genes <- V(ageNetworkGraph)$name
+
+E(PDcoreGraph)$source <- "PD core"
+E(PDcoreMSgraph)$source <- "MassSpec-PD"
+#E(agePDGraph)$source <- "agePD"
+E(prePDintGraph)$source <- "prePD"
+E(ageNetworkGraph)$source <- "agePD"
+
+vertices <- unique(c(
+  V(PDcoreGraph)$name, 
+  #V(agePDGraph)$name,
+  V(PDcoreMSgraph)$name,
+  V(prePDintGraph)$name,
+  V(ageNetworkGraph)$name
+))
+
+# Combine edges
+edges <- rbind(
+  cbind(get.edgelist(PDcoreGraph), source = E(PDcoreGraph)$source),
+  #cbind(get.edgelist(agePDGraph), source = E(agePDGraph)$source),
+  cbind(get.edgelist(PDcoreMSgraph), source = E(PDcoreMSgraph)$source),
+  cbind(get.edgelist(prePDintGraph), source = E(prePDintGraph)$source),
+  cbind(get.edgelist(ageNetworkGraph), source = E(ageNetworkGraph)$source)
+)
+edges_df <- data.frame(
+  from = edges[, 1], 
+  to = edges[, 2], 
+  source = edges[, 3]
+)
+# Create the merged graph
+mergedGraph <- graph_from_data_frame(edges_df, vertices = data.frame(name = vertices), directed = TRUE)
+
+V(mergedGraph)$fill <- ifelse(V(mergedGraph)$name %in% c(PDregulator), "PD signature",
+                              ifelse(V(mergedGraph)$name %in% PDlate_MS, "PD MassSpec",
+                                     ifelse(V(mergedGraph)$name %in% pathAge_genes, "Pathological Aging", 
+                                            ifelse(V(mergedGraph)$name %in% prePD_genes,"PD Beginning","No Info" ))))
+
+
+cAMP_genes <- c("Prkar2a", "Adcy5", "Pde10a", "Pde7b", "Dgkb")
+calcium_genes <- c("Strn", "Calm3", "Cacna2d3", "Camk1d", "Calm1", "Cacna1e", "Atp2a2", "Tpd52", "Anxa3", "Ran", "Dusp1", "Tpt1")
+grm5_genes <- c("Grm5", "Kcnd2", "Lrrc7", "Lrrc47")
+oxidative_genes <- c("Acp1", "Ppia")
+mitochondria_genes <- c("Atp5g1", "Atp5g3", "Atp5h", "Atp5j", "Atp5j2", "Atp5md", "Atp5mpl", "Atp6v0c", "Chchd10",
+                        "Chchd2", "Cox4i1", "Cox5a", "Cox6c", "Cox7a2", "Cycs", "Micos13", "Ndufa1", "Ndufa4", "Ndufa5",
+                        "Ndufa8", "Ndufb10", "Ndufb4", "Ndufb5", "Ndufc1", "Ndufs5", "Ndufs6", "Slc25a4", "Tomm7")
+axon_actin_genes <- c("Actb","Dynll1","Nrg1","Pard3","Phactr1","Tuba4a", "Tubb5","Actg1","Dync1i2", "Tubb2a",
+                      "Ina","Myh10", "Myh9", "Myo18a","Nefh","Nefl","Sntg1","Cd63", "Tuba1a", "Erbb4", "Cfl1","Fgf13")
+proteasome_genes <- c("Ubb", "Ube3a", "Ubc", "Vcp", "Atp6v0c", "Alg2", "Hspa8", "Oaz1")
+translation_genes <- c("Npm1","Rpl34","Eif1", "Rps28")
+synapse_genes <- c("Kcnq5", "Vamp2", "Dlg4", "Nptn", "Thy1", "Cadm1", "Tanc1")
+atpase_genes <- c("Atp1a1", "Atp1a2", "Atp1a3", "Atp1b1")
+other_genes <- c("Fgfr2", "Flii", "H2afz", "Cdkn1b", "Snrpd1", "Anks1b", "Akr1b7", "Slc27a4", "Dhdh")
+
+V(mergedGraph)$color <- ifelse(V(mergedGraph)$name %in% cAMP_genes, "cAMP",
+                               ifelse(V(mergedGraph)$name %in% calcium_genes, "Calcium",
+                                      ifelse(V(mergedGraph)$name %in% oxidative_genes, "Oxidative",
+                                             ifelse(V(mergedGraph)$name %in% axon_actin_genes, "Axon/Actin",
+                                                    ifelse(V(mergedGraph)$name %in% proteasome_genes, "Proteasome", 
+                                                           ifelse(V(mergedGraph)$name %in% atpase_genes,"ATPase" ,
+                                                                  ifelse(V(mergedGraph)$name %in% mitochondria_genes,"Mitochondria","No Info")))))))
+
+## simplifying graph again
+noInfoVertices <- V(mergedGraph)$name[V(mergedGraph)$fill == "No Info"]
+mergedGraph_simple <- mergedGraph
+for(vertex in noInfoVertices) {
+  # Find neighbors of the "No Info" vertex
+  neighbor_ids_in <- neighbors(mergedGraph, vertex, mode = "in")
+  neighbor_ids_out <- neighbors(mergedGraph, vertex, mode = "out")
+  print(paste0("Vertex: ", vertex))
+  # Create edges between all pairs of neighbors
+  if(length(neighbor_ids_in) > 1 & length(neighbor_ids_out) > 1){
+    for(i in 1:(length(neighbor_ids_in))) {
+      for(j in 1:length(neighbor_ids_out)) {
+        # Check if an edge already exists between these two vertices
+        from_vertex_name <- V(mergedGraph)$name[neighbor_ids_in[i]]
+        to_vertex_name <- V(mergedGraph)$name[neighbor_ids_out[j]]
+        print(paste0("Length of present edge ", from_vertex_name, "->", to_vertex_name,": ", get.edge.ids(mergedGraph_simple, c(from_vertex_name, to_vertex_name), directed = TRUE)))
+        if(get.edge.ids(mergedGraph_simple, c(from_vertex_name, to_vertex_name), directed = TRUE) == 0){
+          print("Edge added!")
+          # Add an edge if it doesn't exist. Using vertex names for clarity.
+          mergedGraph_simple <- add_edges(mergedGraph_simple, c(from_vertex_name, to_vertex_name))
+        }
+      }
+    }
+  }
+}
+
+# Step 4: Remove the "No Info" vertices
+mergedGraph_simple <- delete_vertices(mergedGraph_simple, noInfoVertices)
+vertices_to_remove <- V(mergedGraph_simple)[igraph::degree(mergedGraph_simple) == 0]
+mergedGraph_simple <- delete_vertices(mergedGraph_simple, vertices_to_remove)
+E(mergedGraph_simple)$source[which(E(mergedGraph_simple)$source == "agePD")] <- "Pathological Aging"
+E(mergedGraph_simple)$source[which(E(mergedGraph_simple)$source == "prePD")] <- "PD Beginning"
+E(mergedGraph_simple)[from(V(mergedGraph_simple)[name %in% PDlate_MS]) | 
+                        to(V(mergedGraph_simple)[name %in% PDlate_MS])]$source <- "PD MassSpec"
+E(mergedGraph_simple)$source[is.na(E(mergedGraph_simple)$source)] <- "PD signature"
+
+{
+  layout <- create_layout(mergedGraph_simple, layout = 'tree')
+  
+  PDregulator_indices <- which(layout$name %in% PDregulator)
+  prePD_indices <- which(layout$name %in% prePD_genes)
+  PDmass_indices <- which(layout$name %in% PDlate_MS)
+  
+  cAMP_indices <- which(layout$name %in% cAMP_genes)
+  calcium_indices <- which(layout$name %in% calcium_genes)
+  grm5_indices <- which(layout$name %in% grm5_genes)
+  oxidative_indices <- which(layout$name %in% oxidative_genes)
+  axon_actin_indices <- which(layout$name %in% axon_actin_genes)
+  proteasome_indices <- which(layout$name %in% proteasome_genes)
+  translation_indices <- which(layout$name %in% translation_genes)
+  synapse_indices <- which(layout$name %in% synapse_genes)
+  atpase_indices <- which(layout$name %in% atpase_genes)
+  other_indices <- which(layout$name %in% other_genes)
+  
+  
+  # xOffset: the amount to move horizontally
+  layout$x[cAMP_indices] <- layout$x[cAMP_indices] -600
+  layout$x[calcium_indices] <- layout$x[calcium_indices] -290
+  layout$x[grm5_indices] <- layout$x[grm5_indices] -600
+  layout$x[oxidative_indices] <- layout$x[oxidative_indices] -280
+  layout$x[axon_actin_indices] <- layout$x[axon_actin_indices] +20
+  layout$x[proteasome_indices] <- layout$x[proteasome_indices] +100
+  layout$x[translation_indices] <- layout$x[translation_indices] +400
+  layout$x[synapse_indices] <- layout$x[synapse_indices] +600
+  layout$x[atpase_indices] <- layout$x[atpase_indices] -600
+  layout$x[other_indices] <- layout$x[other_indices] +600
+  
+  
+  layout$x[which(layout$name == "Pde10a")] <- layout$x[which(layout$name == "Pde10a")] -100
+  layout$x[which(layout$name == "Adcy5")] <- layout$x[which(layout$name == "Adcy5")] -100
+  layout$x[which(layout$name == "Pde7b")] <- layout$x[which(layout$name == "Pde7b")] -30
+  layout$x[which(layout$name == "Prkar2a")] <- layout$x[which(layout$name == "Prkar2a")] +50
+  layout$x[which(layout$name == "Cacna1e")] <- layout$x[which(layout$name == "Cacna1e")] +20
+  layout$x[which(layout$name == "Tpd52")] <- layout$x[which(layout$name == "Tpd52")] +33
+  layout$x[which(layout$name == "Ndufb10")] <- layout$x[which(layout$name == "Ndufb10")] + 33
+  layout$x[which(layout$name == "Chchd2")] <- layout$x[which(layout$name == "Chchd2")] - 28
+  layout$x[which(layout$name == "Cox4i1")] <- layout$x[which(layout$name == "Cox4i1")] - 28
+  layout$x[which(layout$name %in% c("Myh10", "Myo18a", "Myh9", "Nefh", "Nefl"))] <- 
+    layout$x[which(layout$name %in% c("Myh10", "Myo18a", "Myh9", "Nefh", "Nefl"))] + 28
+  layout$x[which(layout$name == "Vamp2")] <- layout$x[which(layout$name == "Vamp2")] + 50
+  # yOffset: the amount to move vertically
+  layout$y[atpase_indices] <- layout$y[atpase_indices] - 1
+  layout$y[cAMP_indices] <- layout$y[cAMP_indices] + 2
+  layout$y[grm5_indices] <- layout$y[grm5_indices] - 3
+  layout$y[oxidative_indices] <- layout$y[oxidative_indices] + 6
+  layout$y[calcium_indices] <- layout$y[calcium_indices] - 4
+  layout$y[axon_actin_indices] <- layout$y[axon_actin_indices] - 4
+  layout$y[proteasome_indices] <- layout$y[proteasome_indices] + 5
+  layout$y[translation_indices] <- layout$y[translation_indices] + 2.5
+  layout$y[other_indices] <- layout$y[other_indices] - 5
+  
+  layout$y[which(layout$name == "Prkar2a")] <- layout$y[which(layout$name == "Prkar2a")] -0.5
+  layout$y[which(layout$name == "Pde7b")] <- layout$y[which(layout$name == "Pde10a")] + 0.3 
+  layout$y[which(layout$name == "Dgkb")] <- layout$y[which(layout$name == "Adcy5")] 
+  layout$y[which(layout$name == "Strn")] <- layout$y[which(layout$name == "Strn")] -0.5
+  layout$y[which(layout$name == "Tpd52")] <- layout$y[which(layout$name == "Tpd52")] -1
+  layout$y[which(layout$name == "Cacna1e")] <- layout$y[which(layout$name == "Cacna1e")] -0.7
+  layout$y[which(layout$name == "Calm3")] <- layout$y[which(layout$name == "Calm3")] +3
+  layout$y[which(layout$name == "Atp2a2")] <- layout$y[which(layout$name == "Atp2a2")] -0.6
+  layout$y[which(layout$name == "Camk1d")] <- layout$y[which(layout$name == "Camk1d")] -0.2
+  layout$y[which(layout$name == "Cacna2d3")] <- layout$y[which(layout$name == "Cacna2d3")] -0.4
+  layout$y[which(layout$name == "Tpd52")] <- layout$y[which(layout$name == "Tpd52")] + 0.8
+  layout$y[which(layout$name == "Lrrc7")] <- layout$y[which(layout$name == "Lrrc7")] - 0.7
+  layout$y[which(layout$name == "Kcnd2")] <- layout$y[which(layout$name == "Kcnd2")] - 0.4
+  layout$y[which(layout$name == "Acp1")] <- layout$y[which(layout$name == "Acp1")] - 1
+  layout$y[which(layout$name == "Chchd2")] <- layout$y[which(layout$name == "Chchd2")] + 1
+  layout$y[which(layout$name == "Cox4i1")] <- layout$y[which(layout$name == "Cox4i1")] + 0.5
+  layout$y[which(layout$name == "Ndufb10")] <- layout$y[which(layout$name == "Ndufb10")] + 0.5
+  layout$y[which(layout$name == "Tubb2a")] <- layout$y[which(layout$name == "Tubb2a")] + 3.5
+  layout$y[which(layout$name == "Actg1")] <- layout$y[which(layout$name == "Actg1")] + 3
+  layout$y[which(layout$name == "Dync1i2")] <- layout$y[which(layout$name == "Dync1i2")] + 4.3
+  layout$y[which(layout$name == "Actb")] <- layout$y[which(layout$name == "Actb")] - 4.3
+  layout$y[which(layout$name == "Nrg1")] <- layout$y[which(layout$name == "Nrg1")] + 1.3
+  layout$y[which(layout$name == "Pard3")] <- layout$y[which(layout$name == "Pard3")] + 0.8
+  layout$y[which(layout$name == "Nefh")] <- layout$y[which(layout$name == "Nefh")] -0.4
+  layout$y[which(layout$name == "Nefl")] <- layout$y[which(layout$name == "Nefl")] -1.4
+  layout$y[which(layout$name == "Myh9")] <- layout$y[which(layout$name == "Myh9")] -1.8
+  layout$y[which(layout$name == "Myh10")] <- layout$y[which(layout$name == "Myh10")] -1
+  layout$y[which(layout$name == "Myo18a")] <- layout$y[which(layout$name == "Myo18a")] -1.4
+  layout$y[which(layout$name == "Phactr1")] <- layout$y[which(layout$name == "Phactr1")] -1.4
+  layout$y[which(layout$name == "Calm3")] <- layout$y[which(layout$name == "Calm3")] -6
+  layout$y[which(layout$name == "Calm1")] <- layout$y[which(layout$name == "Calm1")] -2
+  layout$y[which(layout$name %in% c("Tubb2a", "Dync1i2", "Actg1"))] <- layout$y[which(layout$name %in% c("Tubb2a", "Dync1i2", "Actg1"))] -7
+  layout$y[which(layout$name %in% c("Ubc", "Vcp", "Atp6v0c"))] <- layout$y[which(layout$name %in% c("Ubc", "Vcp", "Atp6v0c"))] +3
+  layout$y[which(layout$name == "Eif1")] <- layout$y[which(layout$name == "Eif1")] +3
+  layout$y[which(layout$name == "Vamp2")] <- layout$y[which(layout$name == "Vamp2")] +3
+  
+  ggraph(layout) + 
+    geom_edge_link(aes(color = source, start_cap = label_rect(node1.name),
+                       end_cap = label_rect(node2.name)), alpha = 0.3, 
+                   arrow = arrow(type = "closed", length = unit(4, "mm"))) +
+    geom_node_point(aes(color = fill), size = 6.5, show.legend = TRUE, alpha = 0.4) + # Invisible layer for color legend
+    geom_node_label(aes(label = name, fill = fill), repel = FALSE, alpha = 0.3) +
+    scale_fill_manual(values = c("PD signature" = "orange", "PD MassSpec" = "green4", "Pathological Aging" = "darkorchid2",
+                                 "PD Beginning" = "blue"),name = "Source", guide = FALSE) + 
+    scale_color_manual(values = c("PD signature" = "orange", "PD MassSpec" = "green4", "Pathological Aging" = "darkorchid2",
+                                  "PD Beginning" = "blue"), name = "Source") +
+    scale_edge_color_manual(values=c("PD signature" = "orange", "PD MassSpec" = "green4", 
+                                     "Pathological Aging" = "darkorchid2", "PD Beginning" = "blue"), 
+                            name = "Source", guide = FALSE)+ # New scale for the invisible layer
+    theme_graph() + 
+    ggtitle("Testing") +
+    theme(text = element_text(family = "Times", size = 25), 
+          plot.title = element_text(family = "Times", size = 20),
+          legend.text = element_text(size = 20),
+          legend.title = element_text(size = 25),
+          legend.key.size = unit(1,"cm"))
+}
+
+mergedGraph_simple_subset <- delete_vertices(mergedGraph_simple, c("Chchd2", "Cox4i1", "Atp6v0c", "Ndufb10","Vamp2", "Eif1",
+                                                                   "Tuba4a", "Tubb2a", "Actg1", "Vcp", "Ubc"))
+
+layout_subset <- create_layout(mergedGraph_simple_subset, layout = 'tree')
+match_indices <- match(layout_subset$name, layout$name)
+layout_subset$x <- layout$x[match_indices]
+layout_subset$y <- layout$y[match_indices]
+ggraph(layout_subset) + 
+  geom_edge_link(aes(color = source, start_cap = label_rect(node1.name),
+                     end_cap = label_rect(node2.name)), alpha = 0.3, 
+                 arrow = arrow(type = "closed", length = unit(4, "mm"))) +
+  geom_node_point(aes(color = fill), size = 6.5, show.legend = TRUE) + # Invisible layer for color legend
+  geom_node_label(aes(label = name, fill = fill), repel = FALSE, alpha = 1) +
+  scale_fill_manual(values = c("PD signature" = "orange", "PD MassSpec" = "green4", "Pathological Aging" = "darkorchid2"), 
+                    name = "Source", guide = FALSE) + # Original scale, guide set to FALSE
+  scale_color_manual(values = c("PD signature" = "orange", "PD MassSpec" = "green4", "Pathological Aging" = "darkorchid2"), 
+                     name = "Source") +scale_edge_color_manual(values=c("PD signature" = "orange", "PD MassSpec" = "green4", "Pathological Aging" = "darkorchid2"), 
+                                                               name = "Source", guide = FALSE)+ # New scale for the invisible layer
+  theme_graph() + 
+  ggtitle(plotTitle) +
+  theme(text = element_text(family = "Times", size = 25), 
+        plot.title = element_text(family = "Times", size = 20),
+        legend.text = element_text(size = 20),
+        legend.title = element_text(size = 25),
+        legend.key.size = unit(1,"cm"))
+
+qsave(mergedGraph_simple,"/home/jaehyun/Bioinformatic_Data/RDS/SingleCell/LuciVerena_mice/complete_resequenced/unionGraph_Genesets_ver2.qs" )
+# making topic network ----
+set.seed(123)
+cAMP_genes <- c("Prkar2a", "Adcy5", "Pde10a", "Pde7b", "Dgkb")
+calcium_genes <- c("Strn", "Calm3", "Cacna2d3", "Camk1d", "Calm1", "Cacna1e", "Atp2a2", "Tpd52", "Anxa3", "Ran", "Dusp1", "Tpt1")
+grm5_genes <- c("Grm5", "Kcnd2", "Lrrc7", "Lrrc47")
+oxidative_genes <- c("Acp1", "Ppia")
+mitochondria_genes <- c("Atp5g1", "Atp5g3", "Atp5h", "Atp5j", "Atp5j2", "Atp5md", "Atp5mpl", "Chchd10",
+                        "Chchd2", "Cox4i1", "Cox5a", "Cox6c", "Cox7a2", "Cycs", "Micos13", "Ndufa1", "Ndufa4", "Ndufa5",
+                        "Ndufa8", "Ndufb10", "Ndufb4", "Ndufb5", "Ndufc1", "Ndufs5", "Ndufs6", "Slc25a4", "Tomm7")
+axon_actin_genes <- c("Actb","Dynll1","Nrg1","Pard3","Phactr1","Tuba4a", "Tubb5","Actg1","Dync1i2", "Tubb2a",
+                      "Ina","Myh10", "Myh9", "Myo18a","Nefh","Nefl","Sntg1","Cd63", "Tuba1a", "Erbb4", "Cfl1","Fgf13")
+proteasome_genes <- c("Ubb", "Ube3a", "Ubc", "Vcp", "Atp6v0c", "Alg2", "Hspa8", "Oaz1", "Pfdn5")
+translation_genes <- c("Npm1","Rpl34","Eif1", "Rps28")
+synapse_genes <- c("Kcnq5", "Vamp2", "Dlg4", "Nptn", "Thy1", "Cadm1", "Tanc1")
+atpase_genes <- c("Atp1a1", "Atp1a2", "Atp1a3", "Atp1b1")
+other_genes <- c("Fgfr2", "Flii", "H2afz", "Cdkn1b", "Snrpd1", "Anks1b", "Akr1b7", "Slc27a4", "Dhdh")
+
+
+
+unionGraph_geneSets <- qread("/home/jaehyun/Bioinformatic_Data/RDS/SingleCell/LuciVerena_mice/complete_resequenced/unionGraph_Genesets_ver2.qs")
+{
+  unionGraph_topics <- unionGraph_geneSets
+  topics <- list(
+    cAMP_genes = cAMP_genes,
+    Calcium_genes = calcium_genes,
+    Grm5_Interaction_genes = grm5_genes,
+    Oxidative_genes = unique(c(oxidative_genes, mitochondria_genes)),
+    Axon_Actin_genes = axon_actin_genes,
+    Proteasome_genes = proteasome_genes,
+    Translation_genes = translation_genes,
+    Synapse_genes = synapse_genes,
+    ATPase_genes = atpase_genes,
+    other_genes = other_genes
+  )
+  
+  ## for removing ageing
+  unionGraph_topics <- subgraph(unionGraph_topics, vids = V(unionGraph_topics)[-which(V(unionGraph_topics)$fill %in% "Pathological Aging")])
+  unionGraph_topics <- subgraph(unionGraph_topics, vids = V(unionGraph_topics)[-which(V(unionGraph_topics)$name %in%  topics[["Oxidative_genes"]])])
+  
+  ## always run
+  V(unionGraph_topics)$topic <- NA  # Initialize the group attribute
+  for (group_name in names(topics)) {
+    for (gene in topics[[group_name]]) {
+      V(unionGraph_topics)$topic[which(V(unionGraph_topics)$name == gene)] <- group_name
+    }
+  }
+  
+  edges_list <- list()
+  
+  # Iterate through each topic
+  for (topic1 in names(topics)) {
+    # For each topic, iterate through all other topics
+    for (topic2 in names(topics)) {
+      if (topic1 != topic2) { # Ensure we're not comparing the same topic
+        # Find the set of vertices for each topic
+        set1 <- V(unionGraph_topics)[V(unionGraph_topics)$topic == topic1]
+        set2 <- V(unionGraph_topics)[V(unionGraph_topics)$topic == topic2]
+        
+        # Calculate outgoing edges from topic1 to topic2
+        edges_outgoing <- E(unionGraph_topics)[from(set1) & to(set2)]
+        
+        # Store the count with a descriptive name
+        edges_list[[paste(topic1, "to", topic2)]] <- length(edges_outgoing)
+      }
+    }
+  }
+  
+  edgesCounts_df <- data.frame(
+    From_To = names(edges_list),
+    Edge_Count = unlist(edges_list)
+  )
+  
+  total_outgoing_edges <- numeric(length(names(topics)))
+  names(total_outgoing_edges) <- names(topics)
+  
+  # Calculate total outgoing edges for each topic
+  for (topic in names(topics)) {
+    # Sum all outgoing edges for the current topic
+    total_outgoing_edges[topic] <- sum(edgesCounts_df$Edge_Count[grepl(paste(topic, "to"), edgesCounts_df$From_To)])
+  }
+  source_topics <- sapply(strsplit(edgesCounts_df$From_To, " to "), `[`, 1)
+  
+  # Map each source topic to its total outgoing edges and create a new column
+  edgesCounts_df$Total_Outgoing_Edges <- total_outgoing_edges[source_topics]
+  
+  edgesCounts_df$pathScore <- edgesCounts_df$Edge_Count/edgesCounts_df$Total_Outgoing_Edges
+  minPathScore <- min(edgesCounts_df$pathScore, na.rm = TRUE)
+  maxPathScore <- max(edgesCounts_df$pathScore, na.rm = TRUE)
+  edgesCounts_df$pathScoreScaled <- (edgesCounts_df$pathScore - minPathScore) / (maxPathScore - minPathScore)
+  
+  graph <- unionGraph_topics
+  
+  unique_topics <- unique(V(graph)$topic)
+  topic_combinations <- expand.grid(from = unique_topics, to = unique_topics, stringsAsFactors = FALSE)
+  
+  # Initialize a data frame to store results
+  results_df <- data.frame(from_topic = character(), to_topic = character(), observed_count = integer(), p_value = numeric())
+  
+  # Permutation test for each topic combination
+  num_permutations <- 10000
+  
+  for (i in 1:nrow(topic_combinations)) {
+    graph <- unionGraph_topics
+    from_topic <- topic_combinations$from[i]
+    to_topic <- topic_combinations$to[i]
+    
+    # Skip if from_topic is the same as to_topic
+    if (from_topic != to_topic){
+      observed_count <- edgesCounts_df$Edge_Count[which(edgesCounts_df$From_To == paste0(from_topic, " to ", to_topic))]
+      
+      permuted_counts <- numeric(num_permutations)
+      for (j in 1:num_permutations) {
+        # Shuffle topic assignments
+        V(graph)$topic <- sample(V(graph)$topic)
+        
+        # Recalculate the number of edges between topics under this permutation
+        permuted_counts[j] <- count_edges_between_topics(graph, from_topic, to_topic)
+      }
+      
+      # Calculate p-value: proportion of permuted counts >= observed count
+      p_value <- sum(permuted_counts >= observed_count) / num_permutations
+      
+      # Append to the results data frame
+      results_df <- rbind(results_df, data.frame(from_topic = from_topic, to_topic = to_topic, observed_count = observed_count,p_value = p_value))
+      
+    } 
+    
+  }
+  genes_in_topics <- as.numeric(table(V(graph)$topic))
+  names(genes_in_topics) <- names(table(V(graph)$topic))
+  results_df$total_possible_connections <- mapply(function(from, to) {
+    # Total possible connections is the product of the number of genes in each topic
+    genes_in_topics[from] * genes_in_topics[to]
+  }, from = results_df$from_topic, to = results_df$to_topic)
+  
+  results_df$normalized_connection_rate <- with(results_df, observed_count / total_possible_connections)
+  results_df$From_To <- with(results_df, paste(from_topic, "to", to_topic))
+  
+  # Now you can optionally remove the from_topic and to_topic columns if they are no longer needed
+  results_df <- results_df[, !(names(results_df) %in% c("from_topic", "to_topic"))]
+  
+  edgesCounts_df <- merge(edgesCounts_df, results_df, by = "From_To")
+  
+  edges_to_delete <- c()  # Initialize a vector to store edges to delete
+  edge_ends <- ends(unionGraph_topics, E(unionGraph_topics))
+  
+  # Get the topics for source and target vertices
+  source_topics <- V(unionGraph_topics)[edge_ends[,1]]$topic
+  target_topics <- V(unionGraph_topics)[edge_ends[,2]]$topic
+  
+  
+  # Identify edges where the source and target vertices have different topics
+  edges_to_delete <- which(source_topics != target_topics)
+  # Delete these edges from the graph
+  unionGraph_topics_simplified <- delete_edges(unionGraph_topics, E(unionGraph_topics)[edges_to_delete])
+  unionGraph_topics_simplified <- delete_vertices(unionGraph_topics_simplified, intersect(c(other_genes), V(unionGraph_topics_simplified)$name))
+  E(unionGraph_topics_simplified)$alpha <- "Vis"
+  
+  for (topic_name in names(topics)) {
+    if(topic_name != "other_genes" && length(topics[[topic_name]]) > 1){
+      # Simplify the topic name by removing "_genes" if present
+      simplified_topic_name <- gsub("_genes", "", topic_name)
+      
+      # Add a vertex for the topic with the simplified name
+      unionGraph_topics_simplified <- add_vertices(unionGraph_topics_simplified, 1, 
+                                                   name = simplified_topic_name, 
+                                                   topic = simplified_topic_name, 
+                                                   fill = topic_name)
+    }
+  }
+  
+  for (topic_name in names(topics)) {
+    if(topic_name != "other_genes" & length(topics[[topic_name]]) > 1){
+      # Simplify the topic name for matching
+      simplified_topic_name <- gsub("_genes", "", topic_name)
+      
+      # Retrieve the ID of the new topic vertex (assumes unique names)
+      topic_vertex_id <- which(V(unionGraph_topics_simplified)$name == simplified_topic_name)
+      
+      # Iterate over genes in the topic
+      for (gene in topics[[topic_name]]) {
+        # Check if the gene exists in the graph to avoid creating edges to non-existing vertices
+        if (any(V(unionGraph_topics_simplified)$name == gene)) {
+          gene_vertex_id <- which(V(unionGraph_topics_simplified)$name == gene)
+          
+          # Connect the topic vertex to the gene vertex
+          unionGraph_topics_simplified <- add_edges(unionGraph_topics_simplified, c(topic_vertex_id, gene_vertex_id), 
+                                                    attr = list(alpha = "Invis"))
+        }
+      }
+    }
+  }
+  
+  E(unionGraph_topics_simplified)$interaction <- 0
+  E(unionGraph_topics_simplified)$edgeType <- 0
+  edgesCounts_df <- edgesCounts_df %>%
+    mutate(topic1 = str_extract(From_To, "^.+?(?= to)"),
+           topic2 = str_extract(From_To, "(?<=to ).+$"))
+  top_connections_df <- edgesCounts_df %>%
+    group_by(topic1) %>%
+    slice_max(pathScore, n = 2) %>%
+    ungroup()
+  for (i in 1:nrow(top_connections_df)) {
+    # Parse the 'From_To' column to get the source and target topics
+    topics <- strsplit(top_connections_df$From_To[i], " to ")[[1]]
+    source_topic <- gsub("_genes", "", topics[1])
+    target_topic <- gsub("_genes", "", topics[2])
+    
+    # Add an edge between the topic vertices
+    if(!(source_topic %in% c("other")) &&!(target_topic %in% c("other")) && top_connections_df$Edge_Count[i] != 0){
+      unionGraph_topics_simplified <- add_edges(unionGraph_topics_simplified, c(source_topic, target_topic),
+                                                attr = list(alpha = "Interaction",
+                                                            interaction = top_connections_df$pathScoreScaled[i],
+                                                            connection = top_connections_df$Edge_Count[i],
+                                                            permutation = top_connections_df$p_value[i],
+                                                            norm_connection = top_connections_df$normalized_connection_rate[i]))
+    }
+  }
+  
+  top_connections_df <- edgesCounts_df %>%
+    group_by(topic1) %>%
+    slice_max(-log10(p_value), n = 2) %>%
+    ungroup()
+  for (i in 1:nrow(top_connections_df)) {
+    # Parse the 'From_To' column to get the source and target topics
+    topics <- strsplit(top_connections_df$From_To[i], " to ")[[1]]
+    source_topic <- gsub("_genes", "", topics[1])
+    target_topic <- gsub("_genes", "", topics[2])
+    
+    # Add an edge between the topic vertices
+    if(!(source_topic %in% c("other")) &&!(target_topic %in% c("other")) && top_connections_df$Edge_Count[i] != 0){
+      unionGraph_topics_simplified <- add_edges(unionGraph_topics_simplified, c(source_topic, target_topic),
+                                                attr = list(alpha = "Permutation",
+                                                            interaction = top_connections_df$pathScoreScaled[i],
+                                                            connection = top_connections_df$Edge_Count[i],
+                                                            permutation = top_connections_df$p_value[i],
+                                                            norm_connection = top_connections_df$normalized_connection_rate[i]))
+    }
+  }
+  
+  top_connections_df <- edgesCounts_df %>%
+    group_by(topic1) %>%
+    slice_max(normalized_connection_rate, n = 2) %>%
+    ungroup()
+  for (i in 1:nrow(top_connections_df)) {
+    # Parse the 'From_To' column to get the source and target topics
+    topics <- strsplit(top_connections_df$From_To[i], " to ")[[1]]
+    source_topic <- gsub("_genes", "", topics[1])
+    target_topic <- gsub("_genes", "", topics[2])
+    
+    # Add an edge between the topic vertices
+    if(!(source_topic %in% c("other")) &&!(target_topic %in% c("other")) && top_connections_df$Edge_Count[i] != 0){
+      unionGraph_topics_simplified <- add_edges(unionGraph_topics_simplified, c(source_topic, target_topic),
+                                                attr = list(alpha = "normConnect",
+                                                            interaction = top_connections_df$pathScoreScaled[i],
+                                                            connection = top_connections_df$Edge_Count[i],
+                                                            permutation = top_connections_df$p_value[i],
+                                                            norm_connection = top_connections_df$normalized_connection_rate[i]))
+    }
+  }
+  
+  E(unionGraph_topics_simplified)$alpha <- as.factor(E(unionGraph_topics_simplified)$alpha)
+}
+
+topics_list <- list(
+  cAMP = cAMP_genes,
+  Calcium = calcium_genes,
+  Grm5_Interaction = grm5_genes,
+  Oxidative = unique(c(oxidative_genes, mitochondria_genes)),
+  Axon_Actin = axon_actin_genes,
+  Proteasome = proteasome_genes,
+  Translation = translation_genes,
+  Synapse = synapse_genes,
+  ATPase = atpase_genes,
+  other = other_genes
+)
+
+g <- delete_vertices(unionGraph_topics_simplified, mitochondria_genes)
+g <- add_vertices(g, 1, attr = list(name="Mitochondria", fill = "Pathological Aging", color = "Oxidative", topic = "Oxidative_genes" ))
+oxidative_vertex_ids <- which(V(g)$name %in% oxidative_genes)
+new_mitochondria_id <- which(V(g)$name == "Mitochondria")
+# Create edges from "Mitochondria" to each oxidative gene
+edges_to_add <- NULL
+edges_from_mito_to_oxi <- c(rbind(rep(new_mitochondria_id, length(oxidative_vertex_ids)), oxidative_vertex_ids))
+edges_from_oxi_to_mito <- c(rbind(oxidative_vertex_ids, rep(new_mitochondria_id, length(oxidative_vertex_ids))))
+edges_to_add <- c(edges_from_mito_to_oxi, edges_from_oxi_to_mito)
+E(g)$alpha <- as.character(E(g)$alpha)
+g <- add_edges(g, edges_to_add, attr = list(source = "Pathological Aging", alpha = "Vis", interaction = 0, edgeType = 0))
+V(g)$fill[V(g)$name %in% c("Anxa3", "Akr1b7","Slc27a4", "Dhdh", "Pfdn5")] <- "Aging MassSpec"
+
+
+#neighborhood(g, order = 1, nodes = "Mitochondria")
+unionGraph_topics_simplified <- g
+
+axon_actin_age_genes <- c("Tuba4a", "Actg1", "Cd63", "Erbb4", "Tubb2a", "Tuba1a", "Cfl1", "Fgf13")
+E(unionGraph_topics_simplified)$permutation[which(E(unionGraph_topics_simplified)$permutation == 0)] <- 0.0001
+V(unionGraph_topics_simplified)$fill[which(V(unionGraph_topics_simplified)$fill == "PD signature")] <- "PD signature - snRNA"
+V(unionGraph_topics_simplified)$fill[which(V(unionGraph_topics_simplified)$fill == "PD Beginning")] <- "PD Beginning - snRNA"
+V(unionGraph_topics_simplified)$fill[which(V(unionGraph_topics_simplified)$fill == "PD MassSpec")] <- "PD MassSpec - bProtein"
+V(unionGraph_topics_simplified)$fill[which(V(unionGraph_topics_simplified)$fill == "Pathological Aging")] <- "Aging signature - snRNA"
+V(unionGraph_topics_simplified)$fill[which(V(unionGraph_topics_simplified)$name %in% c("Actb", "Dynll1", "Tubb5", "Calm3", "Acp1", "Ubb"))] <- "Pathological Aging - snRNA"
+V(unionGraph_topics_simplified)$fill[which(V(unionGraph_topics_simplified)$fill == "Aging MassSpec")] <- "Aging MassSpec - bProtein"
+V(unionGraph_topics_simplified)$fill[which(V(unionGraph_topics_simplified)$name %in% c("Lrrc47", "Myh10"))] <- "Pathological Aging - bProtein"
+{
+  layout = create_layout(unionGraph_topics_simplified,layout = "linear")
+  topics <- c("cAMP", "Calcium", "ATPase", "Grm5_Interaction", "Proteasome",  "Axon_Actin","Translation",  "Synapse", "Oxidative")
+  y_coordinates <- c(200,150,100,50,0,-50,-100,-150, -200)
+  for(i in seq_along(topics)){
+    topic <- topics[i]
+    y_coord <- y_coordinates[i]
+    layout$y[which(layout$name == topic)] <- y_coord
+  }
+  
+  # Apply the circle placement for each topic
+  for (topic_name in topics) {
+    topic_index <- which(layout$name == topic_name)
+    gene_indices <- which(layout$name %in% topics_list[[topic_name]])
+    
+    if (length(gene_indices) > 0 && length(topic_index) == 1) {
+      center_x <- layout$x[topic_index]
+      center_y <- layout$y[topic_index]
+      
+      # Calculate new positions
+      new_positions <- place_in_circle(center_x, center_y, length(gene_indices), radius = 4) # Adjust radius as needed
+      
+      # Update positions in layout
+      layout$x[gene_indices] <- new_positions$x
+      layout$y[gene_indices] <- new_positions$y
+    }
+  }
+  layout$x[which(layout$name %in% topics)] <- 25
+  layout$x[which(layout$name %in% cAMP_genes)] <- layout$x[which(layout$name %in% cAMP_genes)] - 18
+  layout$x[which(layout$name %in% grm5_genes)] <- layout$x[which(layout$name %in% grm5_genes)] -1
+  layout$x[which(layout$name %in% axon_actin_genes)] <- layout$x[which(layout$name %in% axon_actin_genes)] - 18
+  layout$x[which(layout$name %in% synapse_genes)] <- layout$x[which(layout$name %in% synapse_genes)] - 21
+  layout$x[which(layout$name %in% atpase_genes)] <- layout$x[which(layout$name %in% atpase_genes)] - 24
+  layout$x[which(layout$name %in% translation_genes)] <- layout$x[which(layout$name %in% translation_genes)] - 8
+  layout$x[which(layout$name %in% proteasome_genes)] <- layout$x[which(layout$name %in% proteasome_genes)] - 28
+  layout$x[which(layout$name %in% axon_actin_age_genes)] <- layout$x[which(layout$name %in% axon_actin_age_genes)] + 15
+  
+  layout$x[which(layout$name %in% c("Dgkb"))] <- layout$x[which(layout$name %in% c( "Dgkb"))] - 4
+  layout$x[which(layout$name %in% c("Pde7b"))] <- layout$x[which(layout$name %in% c( "Dgkb"))]
+  layout$x[which(layout$name %in% c("Pde10a"))] <- layout$x[which(layout$name %in% c( "Adcy5"))] 
+  layout$x[which(layout$name %in% c("Prkar2a"))] <- layout$x[which(layout$name %in% c("Prkar2a"))] + 2
+  layout$x[which(layout$name %in% c("Tpd52"))] <- layout$x[which(layout$name %in% c("Tpd52"))] + 3
+  layout$x[which(layout$name %in% c("Strn"))] <- layout$x[which(layout$name %in% c("Prkar2a"))] 
+  layout$x[which(layout$name %in% c("Camk1d"))] <- layout$x[which(layout$name %in% c("Prkar2a"))] + 1
+  layout$x[which(layout$name %in% c("Calm1"))] <- layout$x[which(layout$name %in% c("Calm1"))] - 10
+  layout$x[which(layout$name %in% c("Cacna1e"))] <- layout$x[which(layout$name %in% c("Cacna1e"))] -5.5
+  layout$x[which(layout$name %in% c("Cacna2d3"))] <- layout$x[which(layout$name %in% c("Cacna2d3"))] -7
+  layout$x[which(layout$name %in% c("Atp2a2"))] <- layout$x[which(layout$name %in% c("Atp2a2"))] -5
+  layout$x[which(layout$name %in% c("Tpd52"))] <- layout$x[which(layout$name %in% c("Tpd52"))] -5
+  layout$x[which(layout$name %in% c("Lrrc7"))] <- layout$x[which(layout$name %in% c("Lrrc7"))] - 2
+  layout$x[which(layout$name %in% c("Myh10"))] <- layout$x[which(layout$name %in% c("Myh10"))] - 7
+  layout$x[which(layout$name %in% c("Myh9"))] <- layout$x[which(layout$name %in% c("Myh9"))] - 4
+  layout$x[which(layout$name %in% c("Ina"))] <- layout$x[which(layout$name %in% c("Ina"))] - 8
+  layout$x[which(layout$name %in% c("Nefl"))] <- layout$x[which(layout$name %in% c("Nefl"))] + 7
+  layout$x[which(layout$name %in% c("Nefh"))] <- layout$x[which(layout$name %in% c("Nefh"))] + 4
+  layout$x[which(layout$name %in% c("Tubb5"))] <- layout$x[which(layout$name %in% c("Nefl"))] + 2
+  layout$x[which(layout$name %in% c("Phactr1"))] <- layout$x[which(layout$name %in% c("Myh10"))]
+  layout$x[which(layout$name %in% c("Pard3"))] <- layout$x[which(layout$name %in% c("Pard3"))] - 8
+  layout$x[which(layout$name %in% c("Actb"))] <- layout$x[which(layout$name %in% c("Prkar2a"))] + 3
+  layout$x[which(layout$name %in% c("Nrg1"))] <- layout$x[which(layout$name %in% c("Pard3"))] + 5
+  layout$x[which(layout$name %in% c("Atp1a3"))] <- layout$x[which(layout$name %in% c("Atp1a3"))] - 4
+  layout$x[which(layout$name %in% c("Atp1a1"))] <- layout$x[which(layout$name %in% c("Atp1a1"))] + 4
+  layout$x[which(layout$name %in% c("Acp1"))] <- layout$x[which(layout$name %in% c("Acp1"))] - 18
+  layout$x[which(layout$name %in% c("Calm3"))] <- layout$x[which(layout$name %in% c("Cacna1e"))]  + 3
+  layout$x[which(layout$name %in% c( "Vcp"))] <- layout$x[which(layout$name %in% c("Vcp"))]  + 11
+  layout$x[which(layout$name %in% c("Eif1"))] <- layout$x[which(layout$name %in% c("Nefl"))] + 5
+  layout$x[which(layout$name %in% c("Tpt1"))] <- layout$x[which(layout$name %in% c("Tpt1"))] + 4
+  layout$x[which(layout$name %in% c("Anxa3"))] <- layout$x[which(layout$name %in% c("Tpt1"))] -4.7
+  layout$x[which(layout$name %in% c("Dusp1"))] <- layout$x[which(layout$name %in% c("Tpt1"))] -1.5
+  layout$x[which(layout$name %in% c("Ran"))] <- layout$x[which(layout$name %in% c("Dusp1"))]
+  layout$x[which(layout$name %in% c("Ube3a"))] <- layout$x[which(layout$name %in% c("Camk1d"))]
+  layout$x[which(layout$name %in% c("Ubb"))] <- layout$x[which(layout$name %in% c("Adcy5"))]
+  layout$x[which(layout$name %in% c("Alg2"))] <- layout$x[which(layout$name %in% c("Ube3a"))] - 1
+  layout$x[which(layout$name %in% c("Hspa8"))] <- layout$x[which(layout$name %in% c("Pde7b"))]
+  layout$x[which(layout$name %in% c("Atp6v0c"))] <- layout$x[which(layout$name %in% c("Ubc"))] + 0.5
+  layout$x[which(layout$name %in% c("Myo18a"))] <- layout$x[which(layout$name %in% c("Myo18a"))] - 0.8
+  layout$x[which(layout$name %in% c("Nefh"))] <- layout$x[which(layout$name %in% c("Atp1a2"))]
+  layout$x[which(layout$name %in% c("Nefl"))] <- layout$x[which(layout$name %in% c("Nefh"))] + 3
+  layout$x[which(layout$name %in% c("Dynll1"))] <- layout$x[which(layout$name %in% c("Actb"))]
+  layout$x[which(layout$name %in% c("Tubb5"))] <- layout$x[which(layout$name %in% c("Actb"))]
+  layout$x[which(layout$name %in% c("Tuba4a"))] <- layout$x[which(layout$name %in% c("Lrrc7"))]
+  layout$x[which(layout$name %in% c("Tubb2a"))] <- layout$x[which(layout$name %in% c("Tuba4a"))] + 3
+  layout$x[which(layout$name %in% c("Actg1"))] <- layout$x[which(layout$name %in% c("Tuba4a"))]
+  layout$x[which(layout$name %in% c("Cd63"))] <- layout$x[which(layout$name %in% c("Tubb2a"))]
+  layout$x[which(layout$name %in% c("Tuba1a"))] <- layout$x[which(layout$name %in% c("Tuba1a"))] - 3
+  layout$x[which(layout$name %in% c("Fgf13"))] <- layout$x[which(layout$name %in% c("Grm5"))] 
+  layout$x[which(layout$name %in% c("Erbb4"))] <- layout$x[which(layout$name %in% c("Tpd52"))]
+  layout$x[which(layout$name %in% c("Eif1"))] <- layout$x[which(layout$name %in% c("Tuba1a"))] +2
+  layout$x[which(layout$name %in% c("Npm1"))] <- layout$x[which(layout$name %in% c("Atp1a1"))] 
+  layout$x[which(layout$name %in% c("Rpl34"))] <- layout$x[which(layout$name %in% c("Tubb5"))] 
+  layout$x[which(layout$name %in% c("Cadm1", "Tanc1", "Vamp2"))] <- layout$x[which(layout$name %in% c("Cadm1", "Tanc1", "Vamp2"))] - 4
+  layout$x[which(layout$name %in% c("Thy1"))] <- layout$x[which(layout$name %in% c("Kcnq5"))]
+  layout$x[which(layout$name %in% c("Nptn"))] <- layout$x[which(layout$name %in% c("Nptn"))] + 2 
+  layout$x[which(layout$name %in% c("Mitochondria"))] <- layout$x[which(layout$name %in% c("Tpd52"))] +1
+  layout$x[which(layout$name %in% c("Ppia"))] <- layout$x[which(layout$name %in% c("Eif1"))] 
+  
+  layout$y[which(layout$name %in% proteasome_genes)] <- layout$y[which(layout$name %in% proteasome_genes)] +10
+  layout$y[which(layout$name %in% axon_actin_genes)] <- layout$y[which(layout$name %in% axon_actin_genes)] - 10
+  layout$y[which(layout$name %in% c("Pde10a", "Pde7b"))] <- layout$y[which(layout$name %in% c("Pde10a", "Pde7b"))] - 12
+  layout$y[which(layout$name %in% c("Dgkb", "Adcy5"))] <- layout$y[which(layout$name %in% c("Dgkb", "Adcy5"))] + 10
+  layout$y[which(layout$name %in% c("Camk1d", "Calm1", "Cacna2d3", "Cacna1e"))] <- 
+    layout$y[which(layout$name %in% c("Camk1d", "Calm1", "Cacna2d3", "Cacna1e"))] + 15
+  layout$y[which(layout$name %in% c("Strn", "Atp2a2", "Tpd52"))] <- 
+    layout$y[which(layout$name %in% c("Strn", "Atp2a2", "Tpd52"))] - 15
+  layout$y[which(layout$name %in% c("Kcnd2"))] <- layout$y[which(layout$name %in% c("Kcnd2"))] + 10
+  layout$y[which(layout$name %in% c("Lrrc47"))] <- layout$y[which(layout$name %in% c("Lrrc47"))] - 10
+  layout$y[which(layout$name %in% c("Myh9", "Myh10", "Myo18a", "Nefh", "Nefl"))] <- 
+    layout$y[which(layout$name %in% c("Myh9", "Myh10", "Myo18a", "Nefh", "Nefl"))] - 15
+  layout$y[which(layout$name %in% c("Actb", "Dynll1", "Nrg1", "Pard3", "Phactr1", "Tuba4a", "Tubb5"))] <- 
+    layout$y[which(layout$name %in% c("Actb", "Dynll1", "Nrg1", "Pard3", "Phactr1", "Tuba4a", "Tubb5"))] + 20
+  layout$y[which(layout$name %in% c("Pard3"))] <- layout$y[which(layout$name %in% c("Pard3"))] + 8
+  layout$y[which(layout$name %in% c("Nrg1"))] <- layout$y[which(layout$name %in% c("Pard3"))]
+  layout$y[which(layout$name %in% c("Actb"))] <- layout$y[which(layout$name %in% c("Actb"))] - 9
+  layout$y[which(layout$name %in% c("Alg2"))] <- layout$y[which(layout$name %in% c("Alg2"))] - 9
+  layout$y[which(layout$name %in% c("Thy1"))] <- layout$y[which(layout$name %in% c("Thy1"))] - 15
+  layout$y[which(layout$name %in% c("Nptn"))] <- layout$y[which(layout$name %in% c("Nptn"))] - 5
+  layout$y[which(layout$name %in% c("Kcnq5"))] <- layout$y[which(layout$name %in% c("Kcnq5"))] + 10
+  layout$y[which(layout$name %in% c("Atp1b1"))] <- layout$y[which(layout$name %in% c("Atp1b1"))] -10
+  layout$y[which(layout$name %in% c("Atp1a2"))] <- layout$y[which(layout$name %in% c("Atp1a2"))] +13
+  layout$y[which(layout$name %in% c("Rpl34", "Npm1"))] <- layout$y[which(layout$name %in% c("Rpl34", "Npm1"))] - 8
+  layout$y[which(layout$name %in% c("Ubc"))] <- layout$y[which(layout$name %in% c("Ubc"))]  + 5.5
+  layout$y[which(layout$name %in% c( "Vcp"))] <- layout$y[which(layout$name %in% c("Vcp"))]  - 4
+  layout$y[which(layout$name %in% c( "Actg1"))] <- layout$y[which(layout$name %in% c("Actb"))]
+  layout$y[which(layout$name %in% c( "Vamp2"))] <- layout$y[which(layout$name %in% c("Vamp2"))] + 9
+  layout$y[which(layout$name %in% c("Chchd2", "Ndufb10"))] <- layout$y[which(layout$name %in% c("Chchd2", "Ndufb10"))] + 12
+  layout$y[which(layout$name %in% c("Cox4i1", "Chchd10"))] <- layout$y[which(layout$name %in% c("Cox4i1", "Chchd10"))] - 8
+  layout$y[which(layout$name %in% c("Npm1"))] <- layout$y[which(layout$name %in% c("Npm1"))] + 8
+  layout$y[which(layout$name %in% c("Mitochondria"))] <- layout$y[which(layout$name %in% c("Acp1"))] 
+  layout$y[which(layout$name %in% c("Cacna1e"))] <- layout$y[which(layout$name %in% c("Strn"))]
+  layout$y[which(layout$name %in% c("Anxa3"))] <- layout$y[which(layout$name %in% c("Tpd52"))]
+  layout$y[which(layout$name %in% c("Dusp1"))] <- layout$y[which(layout$name %in% c("Cacna2d3"))]
+  layout$y[which(layout$name %in% c("Ran"))] <- layout$y[which(layout$name %in% c("Anxa3"))] 
+  layout$y[which(layout$name %in% c("Tpt1"))] <- layout$y[which(layout$name %in% c("Dusp1"))] - 10
+  layout$y[which(layout$name %in% c("Hspa8"))] <- layout$y[which(layout$name %in% c("Hspa8"))] + 8
+  layout$y[which(layout$name %in% c("Oaz1"))] <- layout$y[which(layout$name %in% c("Oaz1"))] - 12
+  layout$y[which(layout$name %in% c("Ubc"))] <- layout$y[which(layout$name %in% c("Hspa8"))] 
+  layout$y[which(layout$name %in% c("Atp6v0c"))] <- layout$y[which(layout$name %in% c("Oaz1"))] 
+  layout$y[which(layout$name %in% c("Actb"))] <- layout$y[which(layout$name %in% c("Actb"))] + 9
+  layout$y[which(layout$name %in% c("Dynll1"))] <- layout$y[which(layout$name %in% c("Dynll1"))] - 14
+  layout$y[which(layout$name %in% c("Tubb5"))] <- layout$y[which(layout$name %in% c("Tubb5"))] -30
+  layout$y[which(layout$name %in% c("Tuba4a"))] <- layout$y[which(layout$name %in% c("Nefl"))] -5
+  layout$y[which(layout$name %in% c("Tubb2a"))] <- layout$y[which(layout$name %in% c("Tuba4a"))] +8
+  layout$y[which(layout$name %in% c("Actg1"))] <- layout$y[which(layout$name %in% c("Nrg1"))]
+  layout$y[which(layout$name %in% c("Cd63"))] <- layout$y[which(layout$name %in% c("Nrg1"))] - 8
+  layout$y[which(layout$name %in% c("Erbb4"))] <- layout$y[which(layout$name %in% c("Dynll1"))] - 3
+  layout$y[which(layout$name %in% c("Cfl1"))] <- layout$y[which(layout$name %in% c("Nrg1"))]
+  layout$y[which(layout$name %in% c("Fgf13"))] <- layout$y[which(layout$name %in% c("Dynll1"))]
+  layout$y[which(layout$name %in% c("Rpl34"))] <- layout$y[which(layout$name %in% c("Rpl34"))] - 9
+  layout$y[which(layout$name %in% c("Cadm1"))] <- layout$y[which(layout$name %in% c("Vamp2"))] 
+  layout$y[which(layout$name %in% c("Mitochondria"))] <- layout$y[which(layout$name %in% c("Mitochondria"))] + 10
+  
+  ggraph(layout) + 
+    geom_edge_arc(aes(color = source, 
+                      start_cap = label_rect(node1.name),
+                      end_cap = label_rect(node2.name),
+                      alpha = alpha, width = interaction), strength = 0, # Referring to the edge attribute directly
+                  arrow = arrow(type = "closed", length = unit(4, "mm"))) +
+    scale_edge_alpha_manual(values = c("Vis" = 0.4, "Invis" = 0, "Interaction" = 0, "Permutation" = 1,"normConnect" = 0,"GeneConnect" = 1), guide = FALSE) +
+    geom_node_point(aes(color = fill), size = 6.5, show.legend = TRUE) + # Invisible layer for color legend
+    geom_node_label(aes(label = name, fill = fill), repel = FALSE, alpha = 1) +
+    scale_fill_manual(values = c("PD signature snRNA" = "orange", "PD MassSpec bulk-Protein" = "green4", "Aging signature snRNA" = "darkorchid2","Aging MassSpec bulk-Protein" = "darkorchid4",
+                                 "PD Beginning snRNA" = "blue"),name = "Source", guide = FALSE) + 
+    scale_color_manual(values = c("PD signature snRNA" = "orange", "PD MassSpec bulk-Protein" = "green4", "Aging signature snRNA" = "darkorchid2","Aging MassSpec bulk-Protein" = "darkorchid4",
+                                  "PD Beginning snRNA" = "blue"),name = "Source") +
+    scale_edge_color_manual(values=c("PD signature" = "orange", "PD MassSpec" = "green4", 
+                                     "Pathological Aging" = "darkorchid2", "PD Beginning" = "blue"), 
+                            name = "Source", guide = FALSE)+
+    theme_graph() + 
+    ggtitle("Testing") +
+    theme(text = element_text(family = "Times", size = 25), 
+          plot.title = element_text(family = "Times", size = 20),
+          legend.text = element_text(size = 20),
+          legend.title = element_text(size = 25),
+          legend.key.size = unit(1,"cm"))
+}
+### focus on topic network
+ggraph(layout) + 
+  geom_edge_link(aes(color = source, 
+                     start_cap = label_rect(node1.name),
+                     end_cap = label_rect(node2.name),
+                     alpha = alpha, width = interaction), strength = 0.04, # Referring to the edge attribute directly
+                 arrow = arrow(type = "open", length = unit(4, "mm"))) +
+  scale_edge_alpha_manual(values = c("Vis" = 0.4, "Invis" = 0, "Interaction" = 1, "Permutation" = 0,"normConnect" = 0), guide = FALSE) +
+  geom_node_point(aes(color = fill), size = 6.5, show.legend = TRUE) + # Invisible layer for color legend
+  geom_node_label(aes(label = name, fill = fill), repel = FALSE, alpha = 1) +
+  scale_fill_manual(values = c("PD signature - snRNA" = "orange", "PD MassSpec - bProtein" = "green4", "Aging signature - snRNA" = "darkorchid2","Aging MassSpec - bProtein" = "yellow3",
+                               "PD Beginning - snRNA" = "lightblue", "Pathological Aging - snRNA" = "orange", "Pathological Aging - bProtein" = "green4"),name = "Source", guide = FALSE) + 
+  scale_color_manual(values = c("PD signature - snRNA" = "orange", "PD MassSpec - bProtein" = "green4", "Aging signature - snRNA" = "darkorchid2","Aging MassSpec - bProtein" = "yellow3",
+                                "PD Beginning - snRNA" = "lightblue", "Pathological Aging - snRNA" = "orange", "Pathological Aging - bProtein" = "green4"), name = "Source") +
+  scale_edge_color_manual(values=c("PD signature" = "orange", "PD MassSpec" = "green4", 
+                                   "Pathological Aging" = "darkorchid2", "PD Beginning" = "lightblue"), 
+                          name = "Source", guide = FALSE)+
+  scale_edge_width(guide = FALSE) +
+  theme_graph() + 
+  ggtitle("Testing") +
+  theme(text = element_text(family = "Times", size = 25), 
+        plot.title = element_text(family = "Times", size = 20),
+        legend.text = element_text(size = 20),
+        legend.title = element_text(size = 25),
+        legend.key.size = unit(1,"cm"))
+
+ggraph(layout) + 
+  geom_edge_link(aes(color = source, 
+                     start_cap = label_rect(node1.name),
+                     end_cap = label_rect(node2.name),
+                     alpha = alpha, width = interaction), strength = 0.04, # Referring to the edge attribute directly
+                 arrow = arrow(type = "open", length = unit(4, "mm"))) +
+  scale_edge_alpha_manual(values = c("Vis" = 0.4, "Invis" = 0, "Interaction" = 1, "Permutation" = 0,"normConnect" = 0), guide = FALSE) +
+  geom_node_point(aes(color = fill), size = 6.5, show.legend = TRUE) + # Invisible layer for color legend
+  geom_node_label(aes(label = name, fill = fill), repel = FALSE, alpha = 1) +
+  scale_fill_manual(values = c("PD signature - snRNA" = "orange", "PD MassSpec - bProtein" = "green4", "Aging signature - snRNA" = "darkorchid2","Aging MassSpec - bProtein" = "yellow3",
+                               "PD Beginning - snRNA" = "lightblue", "Pathological Aging - snRNA" = "darkorchid2", "Pathological Aging - bProtein" = "yellow3"),name = "Source", guide = FALSE) + 
+  scale_color_manual(values = c("PD signature - snRNA" = "orange", "PD MassSpec - bProtein" = "green4", "Aging signature - snRNA" = "darkorchid2","Aging MassSpec - bProtein" = "yellow3",
+                                "PD Beginning - snRNA" = "lightblue", "Pathological Aging - snRNA" = "orange", "Pathological Aging - bProtein" = "yellow3"), name = "Source") +
+  scale_edge_color_manual(values=c("PD signature" = "orange", "PD MassSpec" = "green4", 
+                                   "Pathological Aging" = "darkorchid2", "PD Beginning" = "lightblue"), 
+                          name = "Source", guide = FALSE)+
+  scale_edge_width(guide = FALSE) +
+  theme_graph() + 
+  ggtitle("Testing") +
+  theme(text = element_text(family = "Times", size = 25), 
+        plot.title = element_text(family = "Times", size = 20),
+        legend.text = element_text(size = 20),
+        legend.title = element_text(size = 25),
+        legend.key.size = unit(1,"cm"))
+
+ggraph(layout) + 
+  geom_edge_link(aes(color = source, 
+                     start_cap = label_rect(node1.name),
+                     end_cap = label_rect(node2.name),
+                     alpha = alpha, width = interaction), strength = 0.04, # Referring to the edge attribute directly
+                 arrow = arrow(type = "open", length = unit(4, "mm"))) +
+  scale_edge_alpha_manual(values = c("Vis" = 0.4, "Invis" = 0, "Interaction" = 1, "Permutation" = 0,"normConnect" = 0), guide = FALSE) +
+  geom_node_point(aes(color = fill), size = 6.5, show.legend = TRUE) + # Invisible layer for color legend
+  geom_node_label(aes(label = name, fill = fill), repel = FALSE, alpha = 1) +
+  scale_fill_manual(values = c("PD signature - snRNA" = "orange", "PD MassSpec - bProtein" = "green4", "Aging signature - snRNA" = "darkorchid2","Aging MassSpec - bProtein" = "olivedrab1",
+                               "PD Beginning - snRNA" = "lightblue", "Pathological Aging - snRNA" = "orange", "Pathological Aging - bProtein" = "green4"),name = "Source", guide = FALSE) + 
+  scale_color_manual(values = c("PD signature - snRNA" = "orange", "PD MassSpec - bProtein" = "green4", "Aging signature - snRNA" = "darkorchid2","Aging MassSpec - bProtein" = "olivedrab1",
+                                "PD Beginning - snRNA" = "lightblue", "Pathological Aging - snRNA" = "orange", "Pathological Aging - bProtein" = "green4"), name = "Source") +
+  scale_edge_color_manual(values=c("PD signature" = "orange", "PD MassSpec" = "green4", 
+                                   "Pathological Aging" = "darkorchid2", "PD Beginning" = "lightblue"), 
+                          name = "Source", guide = FALSE)+
+  scale_edge_width(guide = FALSE) +
+  theme_graph() + 
+  ggtitle("Testing") +
+  theme(text = element_text(family = "Times", size = 25), 
+        plot.title = element_text(family = "Times", size = 20),
+        legend.text = element_text(size = 20),
+        legend.title = element_text(size = 25),
+        legend.key.size = unit(1,"cm"))
+
+ggraph(layout) + 
+  geom_edge_link(aes(color = source, 
+                     start_cap = label_rect(node1.name),
+                     end_cap = label_rect(node2.name),
+                     alpha = alpha, width = interaction), strength = 0.04, # Referring to the edge attribute directly
+                 arrow = arrow(type = "open", length = unit(4, "mm"))) +
+  scale_edge_alpha_manual(values = c("Vis" = 0.4, "Invis" = 0, "Interaction" = 1, "Permutation" = 0,"normConnect" = 0), guide = FALSE) +
+  geom_node_point(aes(color = fill), size = 6.5, show.legend = TRUE) + # Invisible layer for color legend
+  geom_node_label(aes(label = name, fill = fill), repel = FALSE, alpha = 1) +
+  scale_fill_manual(values = c("PD signature - snRNA" = "orange", "PD MassSpec - bProtein" = "green4", "Aging signature - snRNA" = "darkorchid2","Aging MassSpec - bProtein" = "olivedrab1",
+                               "PD Beginning - snRNA" = "lightblue", "Pathological Aging - snRNA" = "darkorchid2", "Pathological Aging - bProtein" = "olivedrab1"),name = "Source", guide = FALSE) + 
+  scale_color_manual(values = c("PD signature - snRNA" = "orange", "PD MassSpec - bProtein" = "green4", "Aging signature - snRNA" = "darkorchid2","Aging MassSpec - bProtein" = "olivedrab1",
+                                "PD Beginning - snRNA" = "lightblue", "Pathological Aging - snRNA" = "orange", "Pathological Aging - bProtein" = "olivedrab1"), name = "Source") +
+  scale_edge_color_manual(values=c("PD signature" = "orange", "PD MassSpec" = "green4", 
+                                   "Pathological Aging" = "darkorchid2", "PD Beginning" = "lightblue"), 
+                          name = "Source", guide = FALSE)+
+  scale_edge_width(guide = FALSE) +
+  theme_graph() + 
+  ggtitle("Testing") +
+  theme(text = element_text(family = "Times", size = 25), 
+        plot.title = element_text(family = "Times", size = 20),
+        legend.text = element_text(size = 20),
+        legend.title = element_text(size = 25),
+        legend.key.size = unit(1,"cm"))
+### focus on topics
+
+ggraph(layout) + 
+  geom_edge_arc(aes(color = -log10(permutation), 
+                    start_cap = label_rect(node1.name),
+                    end_cap = label_rect(node2.name),
+                    alpha = alpha, width =  -log10(permutation)), strength = 0.04, # Referring to the edge attribute directly
+                arrow = arrow(type = "open", length = unit(4, "mm"))) +
+  scale_edge_alpha_manual(values = c("Vis" = 0.4, "Invis" = 0, "Interaction" = 0, "Permutation" = 1,"normConnect" = 0), guide = FALSE) +
+  geom_node_point(aes(color = fill), size = 6.5, show.legend = TRUE) + # Invisible layer for color legend
+  geom_node_label(aes(label = name, fill = fill), repel = FALSE, alpha = 1) +
+  scale_fill_manual(values = c("PD signature" = "orange", "PD MassSpec" = "green4", "Pathological Aging" = "darkorchid2",
+                               "PD Beginning" = "blue", "cAMP_genes" = "grey90", "Calcium_genes" = "grey90",
+                               "Grm5_Interaction_genes" = "grey90", "Oxidative_genes" = "grey90", 
+                               "Axon_Actin_genes" = "grey90", "Proteasome_genes" = "grey90", "Synapse_genes" = "grey90",
+                               "ATPase_genes" = "grey90", "Translation_genes" = "grey90"),name = "Source", guide = FALSE) + 
+  scale_edge_color_continuous(low = "beige", high = "red", name = "-log10(pval)") +
+  scale_color_manual(values = c("PD signature" = "orange", "PD MassSpec" = "green4", "Pathological Aging" = "darkorchid2",
+                                "PD Beginning" = "blue"), name = "Source") +
+  scale_edge_width(guide = FALSE) +
+  theme_graph() + 
+  ggtitle("Testing") +
+  theme(text = element_text(family = "Times", size = 25), 
+        plot.title = element_text(family = "Times", size = 20),
+        legend.text = element_text(size = 20),
+        legend.title = element_text(size = 25),
+        legend.key.size = unit(1,"cm"))
+
+
+layout_withAge # layout of the total network with pathological aging
+layout # layout with only the PD genes, no aging
+match_indices <- match(layout$name, layout_withAge$name)
+layout$x <- layout_withAge$x[match_indices]
+layout$y <- layout_withAge$y[match_indices]
+ggraph(layout) + 
+  geom_edge_link(aes(color = source, 
+                     start_cap = label_rect(node1.name),
+                     end_cap = label_rect(node2.name),
+                     alpha = alpha, width = interaction), strength = 0.04, # Referring to the edge attribute directly
+                 arrow = arrow(type = "open", length = unit(4, "mm"))) +
+  scale_edge_alpha_manual(values = c("Vis" = 0.4, "Invis" = 0, "Interaction" = 1, "Permutation" = 0,"normConnect" = 0), guide = FALSE) +
+  geom_node_point(aes(color = fill), size = 6.5, show.legend = TRUE) + # Invisible layer for color legend
+  geom_node_label(aes(label = name, fill = fill), repel = FALSE, alpha = 1) +
+  scale_fill_manual(values = c("PD signature snRNA" = "orange", "PD MassSpec bulk-Protein" = "green4", "Aging signature snRNA" = "darkorchid2","Aging MassSpec bulk-Protein" = "green1",
+                               "PD Beginning snRNA" = "lightblue", "Pathological Aging" = "orange"),name = "Source", guide = FALSE) + 
+  scale_color_manual(values = c("PD signature snRNA" = "orange", "PD MassSpec bulk-Protein" = "green4", "Aging signature snRNA" = "darkorchid2","Aging MassSpec bulk-Protein" = "green1",
+                                "PD Beginning snRNA" = "lightblue", "Pathological Aging" = "orange"), name = "Source") +
+  scale_edge_color_manual(values=c("PD signature" = "orange", "PD MassSpec" = "green4", 
+                                   "Pathological Aging" = "darkorchid2", "PD Beginning" = "lightblue"), 
+                          name = "Source", guide = FALSE)+
+  scale_edge_width(guide = FALSE) +
+  theme_graph() + 
+  ggtitle("Testing") +
+  theme(text = element_text(family = "Times", size = 25), 
+        plot.title = element_text(family = "Times", size = 20),
+        legend.text = element_text(size = 20),
+        legend.title = element_text(size = 25),
+        legend.key.size = unit(1,"cm"))
+
+ggraph(layout) + 
+  geom_edge_arc(aes(color = -log10(permutation), 
+                    start_cap = label_rect(node1.name),
+                    end_cap = label_rect(node2.name),
+                    alpha = alpha, width =  -log10(permutation)), strength = 0.04, # Referring to the edge attribute directly
+                arrow = arrow(type = "open", length = unit(4, "mm"))) +
+  scale_edge_alpha_manual(values = c("Vis" = 0.4, "Invis" = 0, "Interaction" = 0, "Permutation" = 1,"normConnect" = 0), guide = FALSE) +
+  geom_node_point(aes(color = fill), size = 6.5, show.legend = TRUE) + # Invisible layer for color legend
+  geom_node_label(aes(label = name, fill = fill), repel = FALSE, alpha = 1) +
+  scale_fill_manual(values = c("PD signature" = "orange", "PD MassSpec" = "green4", "Pathological Aging" = "darkorchid2",
+                               "PD Beginning" = "blue", "cAMP_genes" = "grey90", "Calcium_genes" = "grey90",
+                               "Grm5_Interaction_genes" = "grey90", "Oxidative_genes" = "grey90", 
+                               "Axon_Actin_genes" = "grey90", "Proteasome_genes" = "grey90", "Synapse_genes" = "grey90",
+                               "ATPase_genes" = "grey90", "Translation_genes" = "grey90"),name = "Source", guide = FALSE) + 
+  scale_edge_color_continuous(low = "beige", high = "red", name = "-log10(pval)") +
+  scale_color_manual(values = c("PD signature" = "orange", "PD MassSpec" = "green4", "Pathological Aging" = "darkorchid2",
+                                "PD Beginning" = "blue"), name = "Source") +
+  scale_edge_width(guide = FALSE) +
+  theme_graph() + 
+  ggtitle("Testing") +
+  theme(text = element_text(family = "Times", size = 25), 
+        plot.title = element_text(family = "Times", size = 20),
+        legend.text = element_text(size = 20),
+        legend.title = element_text(size = 25),
+        legend.key.size = unit(1,"cm"))
+
+
+
+
+

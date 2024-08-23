@@ -1,0 +1,171 @@
+# geneInfo is the AgeSignature in CentralRegulatorStats.xlsx
+geneInfo$gene <- fct_reorder(geneInfo$gene, -log10(geneInfo$pAdj_both))
+
+ggplot(geneInfo[which(geneInfo$pAdj_both < 0.05),], 
+       aes(x= -log10(pAdj_both), y = gene, col = MitochondrialFunction, fill = MitochondrialFunction)) +
+  geom_col(size = 0.3) +
+  scale_fill_manual(values = c("No" = "cadetblue3", "Yes" = "indianred2"), name = "Mitochondrial Function?") +
+  scale_color_manual(values = c("No" = "black", "Yes" = "black"), name = "Mitochondrial Function?", guide = FALSE)+
+  theme_minimal() +
+  labs(title = "Regulators",
+       x = "-log10(pAdj)",
+       y = "") +
+  theme(axis.text.y = element_text(size = 4),
+        axis.text.x = element_text(size = 15, angle = 45, hjust = 1),
+        axis.title.x = element_text(size = 25),
+        axis.title.y = element_blank(), # Since y-axis labels are just descriptions
+        legend.position = "right",
+        legend.title = element_text(size = 25),
+        legend.text = element_text(size=25),
+        legend.key.size = unit(2,"line"))
+
+## Age Network: see PIDC script: ageing from MS and ageSign
+ggraph(ageNetwork, layout = "stress") + 
+  geom_edge_link(aes(start_cap = label_rect(node1.name),
+                     end_cap = label_rect(node2.name)), 
+                 arrow = arrow(type = "closed", length = unit(4, "mm"))) +
+  geom_node_label(aes(label = name, fill = regulator ),
+                  repel = FALSE, alpha = 0.8,size = 5) +
+  scale_fill_manual(values = c("Age Mitochondria" = "bisque2", "Top 40 Central Regulators" = "red", "Age MS" = "greenyellow",
+                               "No Info" = "grey"))+
+  theme_graph()+
+  theme(legend.title = element_text(size = 25),
+        legend.text = element_text(size = 25),
+        legend.key.size = unit(2,"line"),
+        text = element_text(family = "Times")) 
+
+ggraph(ageNetwork_simple, layout = "stress") + 
+  geom_edge_link(aes(color = E(ageNetwork_simple)$color,start_cap = label_rect(node1.name),
+                     end_cap = label_rect(node2.name)), alpha = 0.5, 
+                 arrow = arrow(type = "closed", length = unit(4, "mm"))) +
+  geom_node_label(aes(label = name, fill = V(ageNetwork_simple)$regulator),
+                  repel = FALSE, alpha = 0.8,size = 5) +
+  scale_fill_manual(values = c("Age Mitochondria" = "bisque2", "Top 40 Central Regulators" = "red", "Age MS" = "greenyellow",
+                               "No Info" = "grey"), name = "Regulator") +
+  theme_graph() + 
+  theme(legend.title = element_text(size = 25),
+        legend.text = element_text(size = 25),
+        legend.key.size = unit(2,"line"),
+        text = element_text(family = "Times")) 
+
+## GO and Kegg of non-mito aging
+## doing ORA for GO and KEGG to filter out mitochondria related genes
+allres_genes <- as.character(all genes detected in GABA-Rgs9 in synOFF24M vs synOFF6M)
+sigres_genes <- as.character(geneInfo_noMito$gene)
+allres_genes_entrez <- AnnotationDbi::select(org.Mm.eg.db, keys = allres_genes,
+                                             columns = c("ENTREZID"), keytype = "SYMBOL")
+
+sigres_genes_entrez <- AnnotationDbi::select(org.Mm.eg.db, keys = sigres_genes,
+                                             columns = c('ENTREZID'), keytype = 'SYMBOL')
+allres_genes_entrez <- allres_genes_entrez[!is.na(allres_genes_entrez$ENTREZID),]
+sigres_genes_entrez <- sigres_genes_entrez[!is.na(sigres_genes_entrez$ENTREZID),]
+
+gene_input <- data.frame("Gene_Symbol" = intersect(sigres_genes_entrez$SYMBOL,allres_data_frames$`GABA-Rgs9 Neuron_synOFF24M_vs_synOFF6M_allres`$gene), 
+                         "logFC" = (get logFC values from DEG_GABA-Rgs9_all.xlsx),
+                         "FDR_p" = (get adjusted p values from DEG_GABA-Rgs9_all.xlsx))
+
+### GO ont: CC, BP, MF
+for (ont in c("CC","BP","MF")){
+  label <- paste0("eGo",ont)
+  assign(label, enrichGO(gene = sigres_genes_entrez$ENTREZID, 
+                         universe = allres_genes_entrez$ENTREZID,
+                         keyType = "ENTREZID",
+                         OrgDb = org.Mm.eg.db, 
+                         ont = ont, minGSSize = 15,
+                         pAdjustMethod = "BH", 
+                         pvalueCutoff = 0.05,
+                         readable = TRUE)
+  )
+}
+
+go_analysis_BP <- eGoBP
+go_analysis_CC <- eGoCC
+go_analysis_MF <- eGoMF
+go_analysis_BP@result <- subset(eGoBP, eGoBP@result$p.adjust < 0.05)
+go_analysis_CC@result <- subset(eGoCC, eGoCC@result$p.adjust < 0.05)
+go_analysis_MF@result <- subset(eGoMF, eGoMF@result$p.adjust < 0.05)
+go_analysis <- list(go_analysis_BP, go_analysis_CC, go_analysis_MF)
+
+go_result <- go_analysis
+go_result$BP@result$ont <- 'BP'
+go_result$CC@result$ont <- 'CC'
+go_result$MF@result$ont <- 'MF'
+
+combined_go_df <- rbind(go_result$BP@result, go_result$CC@result, go_result$MF@result)
+combined_go_df <- combined_go_df %>%
+  rowwise() %>%
+  mutate(Fold_Enrichment = (as.numeric(str_split(GeneRatio, "/")[[1]][1]) / as.numeric(str_split(GeneRatio, "/")[[1]][2])) /
+           (as.numeric(str_split(BgRatio, "/")[[1]][1]) / as.numeric(str_split(BgRatio, "/")[[1]][2])))
+combined_go_df <- combined_go_df %>%
+  group_by(ont) %>%
+  mutate(Rank = rank(-Fold_Enrichment)) %>%
+  dplyr::filter(Rank <= 5) %>%
+  ungroup() %>%
+  mutate(ont = factor(ont, levels = c("MF", "CC","BP" ))) %>% # Set specific order for 'ont'
+  arrange(ont, Fold_Enrichment) %>%
+  mutate(Description_Ordered = factor(Description, levels = unique(Description))) # Order within each ont
+combined_go_df$shortDescr <- combined_go_df$Description
+combined_go_df$shortDescr[which(combined_go_df$Description == "RNA polymerase II core promoter sequence-specific DNA binding")] <- "RNA polyermase II DNA binding"  
+combined_go_df$shortDescr[which(combined_go_df$Description == "positive regulation of miRNA transcription")] <- "positive regulation of transcription"  
+combined_go_df$shortDescr[which(combined_go_df$Description == "ATP-dependent protein folding chaperone")] <- "ATP-dependent protein chaperone"  
+combined_go_df$shortDescrID <- paste0(combined_go_df$shortDescr," (",combined_go_df$ID,")")
+combined_go_df$shortDescrID <- factor(combined_go_df$shortDescrID, levels = combined_go_df$shortDescrID[order(combined_go_df$Description_Ordered)])
+
+result <- run_pathfindR(
+  input=gene_input,
+  convert2alias = FALSE,
+  gene_sets = "mmu_KEGG",
+  pin_name_path = "mmu_STRING",
+  output_dir = "/home/jaehyun/NAS/Labmembers/Lee_Jaehyun/Labbook/pathfindR/KEGGtimelateON",
+  adj_method = "BH", enrichment_threshold = 0.05,
+  p_val_threshold = 1,
+  plot_enrichment_chart = TRUE
+)
+
+result$shortDescr <- result$Term_Description
+result$shortDescr[which(result$shortDescr == "Adrenergic signaling in cardiomyocytes")] <- "Adrenergic signaling"
+result$shortDescr[which(result$shortDescr == "Longevity regulating pathway")] <- "Longevity pathway"
+result$shortDescr[which(result$shortDescr == "Oxytocin signaling pathway")] <- "Oxytocin signaling"
+pdf(file="/home/jaehyun/NAS/Labmembers/Lee_Jaehyun/Labbook/Plots/AgeNoMito_GO_KEGG.pdf", width = 15, height = 10)
+
+print(ggplot(combined_go_df, aes(x = Fold_Enrichment, y = shortDescrID, fill = ont)) +
+        geom_col() +
+        theme_minimal() +
+        scale_fill_manual(values = c("BP" = "lightblue", "MF" = "royalblue1", "CC" = "darkblue"),
+                          name = "Ontology") + 
+        labs(title = "GO Top 5 Representatives",
+             x = "Fold Enrichment",
+             y = "") +
+        theme(title = element_text(size=20),
+              axis.text.y = element_text(size = 25, face = "bold"),
+              axis.text.x = element_text(size=25),
+              axis.title.x = element_text(size = 25, face = "bold"),
+              legend.text = element_text(size=15),
+              legend.title = element_text(size = 15, face = "bold"),
+              axis.line = element_line(colour = "black"),  # Make the coordinate axis black
+              axis.ticks = element_line(colour = "black"),  # Make the ticks black
+              panel.grid.major.y = element_blank(),
+              panel.grid.minor.x = element_blank(),
+              panel.grid.major.x = element_line(linewidth = 2),
+              axis.ticks.y = element_blank())  # Remove the y-axis ticks
+)
+
+ggplot(result[c(1:15),], aes(x = -log10(lowest_p), 
+                                                          y = reorder(shortDescr, -log10(lowest_p)))) +
+        geom_bar(stat = "identity", fill = "tomato") +
+        theme_minimal() +
+        labs(title = "Kegg Top 15 Representatives",
+             x = "Fold Enrichment",
+             y = "") +
+        theme(title = element_text(size=20),
+              axis.text.y = element_text(size = 25, face = "bold"),
+              axis.text.x = element_text(size=25),
+              axis.title.x = element_text(size = 25, face = "bold"),
+              legend.text = element_text(size=15),
+              legend.title = element_text(size = 15, face = "bold"),
+              axis.line = element_line(colour = "black"),  # Make the coordinate axis black
+              axis.ticks = element_line(colour = "black"),  # Make the ticks black
+              panel.grid.major.y = element_blank(),
+              panel.grid.minor.x = element_blank(),
+              panel.grid.major.x = element_line(linewidth = 2),
+              axis.ticks.y = element_blank())  # Remove the y-axis ticks

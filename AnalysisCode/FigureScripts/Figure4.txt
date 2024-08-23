@@ -1,0 +1,163 @@
+# expression of S1S2 and other genes ----
+condColors <- c("synOFF6M" = "seashell3", "synOFF16M" = "gray47", "synOFF24M" = "gray5", "synON6M" = "lightcoral", 
+                "synON16M" = "red", "synON24M" = "red3",
+                "synlateON16M" = "royalblue1", "synlateON24M" = "blue")
+
+DefaultAssay(seurat_integrated) <- "SCT"
+
+gene_data <- FetchData(seurat_integrated, vars = c("CellLevel3","S1S2","condition"))
+
+# Creating the boxplot with mean points, split by lucitrt
+gene_data$lucitrt[which(str_detect(gene_data$lucitrt, "ON"))] <- "ON" 
+gene_data$lucitrt[which(str_detect(gene_data$lucitrt, "OFF"))] <- "OFF"
+
+gene_data$Group <- paste(gene_data$CellLevel3, gene_data$lucitrt, sep = "_")
+gene_data_ON <- gene_data[which(gene_data$lucitrt == "ON"),]
+gene_data_ON$CellLevel3 <- factor(gene_data_ON$CellLevel3, 
+                                  levels = c("Microglia","Vascular Cell", "Choroid Plexus","Astrocyte","Oligodendrocyte","OPC",
+                                             "Cholinergic Neuron","Dopaminergic Neuron", "Vglut2-Nova1 Neuron", "Vglut2-Synpo2 Neuron",
+                                             "Vglut1-Mndal Neuron","Vglut1-Oprk1 Neuron", "Vglut1-Bmpr1b Neuron","Vglut1-Prox1 Neuron",
+                                             "Vglut1-Parm1 Neuron", "Vglut1-Npas3 Neuron", "Vglut1-Shc4 Neuron", "Vglut1-Col19a1 Neuron", 
+                                             "Vglut1-Rorb Neuron",  "Vglut1-Reln Neuron", "Vglut1-Foxp2 Neuron", "Vglut1-Cdh20 Neuron", 
+                                             "Vglut1-Spag16 Neuron",
+                                             "GABA-Rgs9 Neuron", "GABA-Etv1 Neuron", "GABA-Chst9 Neuron", "GABA-Vip Neuron", "GABA-Ano1/2 Neuron",
+                                             "GABA-Lamp5 Neuron", "GABA-Sst Neuron","GABA-Frem1 Neuron","GABA-Rmst/Tshz2 Neuron", "GABA-Cemip Neuron",
+                                             "GABA-Otx2 Neuron", "GABA-Six3 Neuron"))
+
+
+## S1S2 expression in ON and lateON condition bulked over CellLevel3 annotation
+ggplot(gene_data, 
+       aes(x = CellLevel3, y = S1S2, fill = CellLevel3)) +
+  stat_boxplot(geom="errorbar") +
+  geom_boxplot(outlier.shape = NA,  alpha = 1) +
+  stat_summary(fun = mean, geom = "point", 
+               aes(fill = "grey60"),  # Add border color here
+               shape = 21,  # This shape supports both fill and color
+               size = 3, stroke = 1,color = "black") +  # Adjust `stroke` for border thickness
+  labs(title = paste("Expression of", "S1S2", "across Cell Types in overexpressing Condition"), 
+       x = "Cell Type and Treatment", 
+       y = "SCT normalized Log Expression Level") +
+  scale_fill_manual(values = manColors_CellLevel3)+
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 15),
+        axis.title.x = element_text(size = 0),
+        axis.text.y = element_text(size = 15),
+        axis.title.y = element_text(size = 20),
+        title = element_text(size = 20),
+        legend.position = "none")
+
+
+seurat_integrated_bgn <- subset(seurat_integrated, CellLevel3 == "GABA-Rgs9 Neuron")
+
+
+gene_data <- FetchData(seurat_integrated_bgn, vars = c("S1S2","condition"))
+
+ggplot(gene_data, 
+       aes(x = condition, y = Cacna2d3, fill = condition)) +
+  stat_boxplot(geom="errorbar") +
+  geom_boxplot(outlier.shape = NA,  alpha = 1) +
+  stat_summary(fun = mean, geom = "point", 
+               aes(fill = "grey60"),  # Add border color here
+               shape = 21,  # This shape supports both fill and color
+               size = 3, stroke = 1,color = "black") +  # Adjust `stroke` for border thickness
+  labs(title = paste("Expression of", "S1S2", "across Conditions"), 
+       x = "Cell Type and Treatment", 
+       y = "SCT normalized Log Expression Level") +
+  scale_fill_manual(values = condColors)+
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 15),
+        axis.title.x = element_text(size = 0),
+        axis.text.y = element_text(size = 15),
+        axis.title.y = element_text(size = 20),
+        title = element_text(size = 20),
+        legend.position = "none")
+
+# creating similarity heatmap ----
+{
+  seurat_deg <- subset(seurat_integrated, CellLevel3 %in% c("GABA-Rgs9 Neuron"))
+  counts <- AggregateExpression(seurat_deg,
+                                group.by = "bulk",
+                                assays = "RNA",
+                                slot = "counts",
+                                return.seurat = FALSE)
+  
+  counts <- counts$RNA
+  keep <- rowSums(counts>3) >= 4
+  length(which(keep,TRUE))
+  counts <- counts[keep,]
+  counts <- counts[!grepl("^mt-", rownames(counts)), ]
+  counts <- counts[-which(rownames(counts) %in% rb), ]
+  metadata <- seurat_deg@meta.data
+  colData <- data.frame(bulk = colnames(counts))
+  rownames(colData) <- colnames(counts)
+  
+  colData$lucitrt <- "NA"
+  colData$lucitrt[which(str_detect(colData$bulk, "-synON24M-"))] <- "synON24M"
+  colData$lucitrt[which(str_detect(colData$bulk, "-synON16M-"))] <- "synON16M"
+  colData$lucitrt[which(str_detect(colData$bulk, "-synON6M-"))] <- "synON6M"
+  colData$lucitrt[which(str_detect(colData$bulk, "-synOFF24M-"))] <- "synOFF24M"
+  colData$lucitrt[which(str_detect(colData$bulk, "-synOFF16M-"))] <- "synOFF16M"
+  colData$lucitrt[which(str_detect(colData$bulk, "-synOFF6M-"))] <- "synOFF6M"
+  colData$lucitrt[which(str_detect(colData$bulk, "-synlateON24M-"))] <- "synlateON24M"
+  colData$lucitrt[which(str_detect(colData$bulk, "-synlateON16M-"))] <- "synlateON16M"
+  
+  colData$age <- "NA"
+  colData$age[which(str_detect(colData$bulk, "-6M--"))] <- "6M"
+  colData$age[which(str_detect(colData$bulk, "-16M--"))] <- "16M"
+  colData$age[which(str_detect(colData$bulk, "-24M-"))] <- "24M"
+  
+  colData$sex <- "NA"
+  colData$sex[which(str_detect(colData$bulk, "-male"))] <- "male"
+  colData$sex[which(str_detect(colData$bulk, "-female"))] <- "female"
+  colData$sex[which(str_detect(colData$bulk, "-female.male"))] <- "female.male"
+  
+  colData$batch <- "NA"
+  colData$batch[which(str_detect(colData$bulk, "--Batch4"))] <- "Batch4"
+  colData$batch[which(str_detect(colData$bulk, "-Batch3"))] <- "Batch3"
+  
+  dds <- DESeqDataSetFromMatrix(counts, 
+                                colData = colData, 
+                                design =  ~lucitrt)
+  
+  ## vst and visualization
+  dds <- estimateSizeFactors(dds)
+  dds <- estimateDispersions(dds)
+  vs <- varianceStabilizingTransformation(dds, blind=TRUE)
+}
+mat <- assay(vs)
+mm <- model.matrix(~lucitrt, colData(vs))
+mat <- limma::removeBatchEffect(mat, batch=vs$sex, batch2 = vs$batch, design=mm)
+vs_cor <- cor(mat, method = "pearson")
+sampleNames_RNA <- c("synOFF16M-1", "synlateON16M-1","synlateON16M-2",
+                     "synON6M-1","synOFF6M-1","synON6M-2",
+                     "synOFF6M-2","synlateON24M-1","synlateON24M-2",
+                     "synON24M-1","synON24M-2","synON24M-3",
+                     "synOFF24M-1","synON16M-1","synON16M-2",
+                     "synOFF16M-2","synOFF24M-2")
+colnames(vs_cor) <- sampleNames_RNA
+rownames(vs_cor) <- sampleNames_RNA
+dend <- as.dendrogram(hclust(dist(vs_cor)))
+plot(dend)
+dend <- dendextend::rotate(dend, c(1,3,2,4,5,6,12,13,16,17,14,15,7:11)) # `k` is the branch you want to rotate
+plot(dend)
+conditions <- sapply(strsplit(sampleNames_RNA, "-"), function(x) paste(x[-length(x)], collapse = "-"))
+conditions <- factor(conditions, levels = c("synOFF6M", "synOFF16M", "synOFF24M", "synON6M", "synON16M", "synON24M", "synlateON16M", "synlateON24M"))
+condition_annotation <- HeatmapAnnotation(df = data.frame(Condition = conditions),
+                                          col = list(Condition = condColors),
+                                          which = "col", border = TRUE, gp = gpar(col = "black"))
+condition_annotation_row <- HeatmapAnnotation(df = data.frame(Condition = conditions),
+                                              col = list(Condition = condColors),
+                                              which = "row", border = TRUE,gp = gpar(col = "black"),
+                                              show_annotation_name = FALSE, show_legend = FALSE)
+Heatmap(vs_cor,
+        row_dend_reorder = FALSE, # Prevent automatic reordering
+        col = colorRamp2(c(0.92, 0.96,1), c("blue", "white","red")),
+        column_dend_reorder = FALSE,
+        cluster_rows = dend, # Use your custom dendrogram
+        cluster_columns = dend, # Assuming you want the same for columns
+        show_row_names = TRUE,
+        show_column_names = FALSE,
+        top_annotation = condition_annotation,
+        left_annotation = condition_annotation_row,
+        #column_split = 4,
+        rect_gp = gpar(col = "black", lwd = 1))
