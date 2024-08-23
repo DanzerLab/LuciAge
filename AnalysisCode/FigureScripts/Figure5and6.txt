@@ -486,6 +486,74 @@ database_Network_ora_PIDC <- function(database, geneSet, geneSet_name, n_hits,
   
   return(list(graph = subgraph_g, plot = plot))
 }
+
+# making combined database from the different omniPath databases ----
+mouse = 10090
+## Network database
+allNetwork <- import_all_interactions(organism = mouse)
+onlyOmniNetwork <- import_omnipath_interactions(organism = mouse)
+allNetwork_RNA <- dplyr::filter(allNetwork, type == "transcriptional")
+allNetwork_protein <- dplyr::filter(allNetwork, type == "post_translational")
+## Post translational modification
+onlyOmniPTM <- import_omnipath_enzsub(organism = mouse)
+onlyOmniPTM <- get_signed_ptms(onlyOmniPTM, onlyOmniNetwork)
+## Complex
+onlyOmniComplex <- import_omnipath_complexes(organism = mouse)
+onlyOmniComplex <- onlyOmniComplex[which(is.na(onlyOmniComplex$name) == FALSE),]
+
+new_complexes_df <- data.frame()
+for (i in c(1:nrow(onlyOmniComplex))) {
+  print(paste0("Processing ", i, "/",nrow(onlyOmniComplex)))
+  components_split <- strsplit(onlyOmniComplex$components[i], "_")[[1]]
+  components_genesymbols_split <- strsplit(onlyOmniComplex$components_genesymbols[i], "_")[[1]]
+  
+  if (length(components_split) > 1 && length(components_split) == length(components_genesymbols_split) && length(components_split) < 45){
+    # Format gene names
+    components_genesymbols_split <- sapply(components_genesymbols_split, function(x) {
+      paste0(toupper(substr(x, 1, 1)), tolower(substr(x, 2, nchar(x))))
+    })
+    
+    # Create all possible pairs within each complex
+    pairs <- expand.grid(source = components_split, target = components_split)
+    pairs_genesymbols <- expand.grid(source_genesymbol = components_genesymbols_split, target_genesymbol = components_genesymbols_split)
+    
+    # Filter out pairs of the same component
+    valid_pairs <- pairs$source != pairs$target
+    pairs <- pairs[valid_pairs, ]
+    pairs_genesymbols <- pairs_genesymbols[valid_pairs, ]
+    
+    # Repeat the source value for each pair
+    sources_repeated <- rep(onlyOmniComplex$sources[i], nrow(pairs))
+    
+    # Combine into a single data frame
+    new_complexes_df <- rbind(new_complexes_df, data.frame(pairs, pairs_genesymbols, consensus_stimulation = NA, consensus_inhibition = NA,sources = sources_repeated, type = "Complex"))
+  }
+}
+## combining dataframes
+combinedProtein_df <- transform(allNetwork_protein[, c("source","target","source_genesymbol", "target_genesymbol", "consensus_stimulation", "consensus_inhibition", "sources")],
+                                type = "PPI")
+combinedRNA_df <- transform(allNetwork_RNA[, c("source","target","source_genesymbol", "target_genesymbol", "consensus_stimulation", "consensus_inhibition", "sources")],
+                                type = "RNA")
+PTM_edit <- transform(onlyOmniPTM[, c("enzyme","substrate","enzyme_genesymbol", "substrate_genesymbol", "is_stimulation", "is_inhibition", "sources")],
+                      type = "PTM",
+                      source = enzyme,
+                      target = substrate,
+                      source_genesymbol = enzyme_genesymbol,
+                      target_genesymbol = substrate_genesymbol,
+                      consensus_stimulation = is_stimulation,
+                      consensus_inhibition = is_inhibition)[names(combinedProtein_df)]
+new_complexes_df <- new_complexes_df %>%
+  # Create a unique identifier for each row by concatenating source and target
+  mutate(combined_genesymbol = paste(source_genesymbol, target_genesymbol,
+                                     sep = ",")) %>%
+  # Remove duplicate rows based on the unique identifier
+  distinct(combined_genesymbol, .keep_all = TRUE) %>%
+  # Optionally remove the unique identifier if it's no longer needed
+  dplyr::select(-combined_genesymbol)
+combinedProtein_df <- rbind(combinedProtein_df, PTM_edit, new_complexes_df)
+combinedProteinRNA_df <- rbind(combinedProtein_df, combinedRNA_df)
+
+
 # Graphs from PIDC all ----
 ## running the non-splitable conditions
 mouse = 10090
@@ -639,7 +707,7 @@ qsave(master_df,"ORA_PDsign_network_masterdf.qs")
 # PIDC and omnipath and STRING----
 mouse = 10090
 string_db <- STRINGdb$new(species=mouse,score_threshold=600, network_type="full", input_directory="")
-combinedProteinRNA_df <- "get all interactions from omnipathR"
+combinedProteinRNA_df <- "see top"
 PIDC_list <- qread("PIDC_10perct.qs")
 comparisons <- sub("^[^_]*_(.*)$", "\\1", names(PIDC_list))
 comparisons_unique <- unique(comparisons)
@@ -2075,8 +2143,4 @@ ggraph(layout) +
         legend.text = element_text(size = 20),
         legend.title = element_text(size = 25),
         legend.key.size = unit(1,"cm"))
-
-
-
-
 
